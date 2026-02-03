@@ -5,6 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import asyncio
+import qasync
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
 from ffa_simulator.gui.main_window import MainWindow
@@ -17,12 +19,12 @@ def main():
     logger.info("FFA Simulator Starting...")
     logger.info("=" * 60)
     
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
-    
     app = QApplication(sys.argv)
     app.setApplicationName("FFA Simulator")
     app.setOrganizationName("Forge & Flight Holdings, Inc.")
+    
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
     
     window = MainWindow()
     window.show()
@@ -30,7 +32,8 @@ def main():
     logger.info("Main window displayed")
     logger.info("Ready for simulation")
     
-    sys.exit(app.exec())
+    with loop:
+        loop.run_forever()
 
 if __name__ == "__main__":
     main()

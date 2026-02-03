@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                 QPushButton, QLabel, QComboBox, QTextEdit, QSplitter)
 from PySide6.QtCore import Qt
@@ -10,7 +11,7 @@ logger = logging.getLogger(__name__)
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.process_manager = None
+        self.process_manager = ProcessManager()
         self.telemetry_bridge = None
         self.init_ui()
         
@@ -107,25 +108,61 @@ class MainWindow(QMainWindow):
         self.log_display.append("▶ Starting simulation...")
         
         self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.status_label.setText("Status: Running")
-        self.status_label.setStyleSheet("padding: 10px; background-color: #51cf66; color: white; border-radius: 5px;")
+        self.stop_button.setEnabled(False)
+        self.vehicle_combo.setEnabled(False)
+        self.scenario_combo.setEnabled(False)
         
-        self.log_display.append("✓ Docker containers starting...")
-        self.log_display.append("✓ Gazebo simulation initializing...")
-        self.log_display.append("✓ ArduPilot SITL launching...")
-        self.log_display.append("✓ Waiting for MAVLink heartbeat...")
+        self.status_label.setText("Status: Starting...")
+        self.status_label.setStyleSheet("padding: 10px; background-color: #ffd43b; color: black; border-radius: 5px;")
         
-        logger.info("Simulation started successfully")
+        vehicle = self.vehicle_combo.currentText().lower().replace(" ", "_")
+        scenario = self.scenario_combo.currentText().lower().replace(" ", "_")
+        
+        async def start_async():
+            try:
+                self.log_display.append("✓ Connecting to Docker...")
+                await self.process_manager.start_simulation(vehicle, scenario)
+                
+                self.start_button.setEnabled(False)
+                self.stop_button.setEnabled(True)
+                self.status_label.setText("Status: Running")
+                self.status_label.setStyleSheet("padding: 10px; background-color: #51cf66; color: white; border-radius: 5px;")
+                self.log_display.append("✓ Simulation running!")
+                
+            except Exception as e:
+                logger.error(f"Failed to start simulation: {e}")
+                self.log_display.append(f"✗ Error: {str(e)}")
+                
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                self.vehicle_combo.setEnabled(True)
+                self.scenario_combo.setEnabled(True)
+                self.status_label.setText("Status: Error")
+                self.status_label.setStyleSheet("padding: 10px; background-color: #ff6b6b; color: white; border-radius: 5px;")
+        
+        asyncio.create_task(start_async())
     
     def stop_simulation(self):
         logger.info("Stopping simulation...")
         self.log_display.append("■ Stopping simulation...")
         
-        self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        self.status_label.setText("Status: Stopped")
-        self.status_label.setStyleSheet("padding: 10px; background-color: #ff6b6b; color: white; border-radius: 5px;")
         
-        self.log_display.append("✓ Simulation stopped")
-        logger.info("Simulation stopped")
+        async def stop_async():
+            try:
+                await self.process_manager.stop_simulation()
+                
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                self.vehicle_combo.setEnabled(True)
+                self.scenario_combo.setEnabled(True)
+                self.status_label.setText("Status: Stopped")
+                self.status_label.setStyleSheet("padding: 10px; background-color: #ff6b6b; color: white; border-radius: 5px;")
+                self.log_display.append("✓ Simulation stopped")
+                
+            except Exception as e:
+                logger.error(f"Error stopping simulation: {e}")
+                self.log_display.append(f"✗ Error: {str(e)}")
+                self.stop_button.setEnabled(True)
+        
+        asyncio.create_task(stop_async())

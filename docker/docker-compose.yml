@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  ardupilot-sitl:
+    image: radarku/ardupilot-ubuntu:latest
+    container_name: ffa-ardupilot-sitl
+    network_mode: host
+    environment:
+      - INSTANCE=0
+      - LAT=35.3632
+      - LON=-82.8365
+      - ALT=600
+      - DIR=270
+      - MODEL=quadplane
+      - SPEEDUP=1
+      - VEHICLE=ArduPlane
+    command: >
+      sim_vehicle.py
+      --vehicle ArduPlane
+      --model quadplane
+      --add-param-file=/ardupilot/Tools/autotest/default_params/quadplane.parm
+      --console
+      --map
+    stdin_open: true
+    tty: true
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    environment:
+      - DISPLAY=${DISPLAY}
