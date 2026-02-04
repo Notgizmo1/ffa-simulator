@@ -1,10 +1,13 @@
 import logging
 import numpy as np
+from math import radians, cos, sin, asin, sqrt
 from collections import deque
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                 QPushButton, QListWidget, QSpinBox, QDoubleSpinBox,
-                                QGroupBox, QGridLayout, QFileDialog, QMessageBox)
+                                QGroupBox, QGridLayout, QFileDialog, QMessageBox,
+                                QProgressBar)
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont
 import pyqtgraph as pg
 
 logger = logging.getLogger(__name__)
@@ -35,6 +38,7 @@ class MissionControlPanel(QWidget):
         self.waypoints = []
         self.current_waypoint_index = -1
         self.home_position = None  # (lat, lon)
+        self.mavlink_bridge = None  # Will be set externally
         
         self.init_ui()
         
@@ -58,6 +62,10 @@ class MissionControlPanel(QWidget):
         middle_layout.addWidget(waypoint_widget, stretch=1)
         
         layout.addLayout(middle_layout)
+        
+        # Bottom: Mission Progress panel (NEW - Phase 2.2)
+        progress_panel = self._create_mission_progress_panel()
+        layout.addWidget(progress_panel)
         
         logger.info("Mission control panel initialized")
     
@@ -188,6 +196,288 @@ class MissionControlPanel(QWidget):
         layout.addWidget(upload_btn)
         
         return group
+    
+    def _create_mission_progress_panel(self):
+        """
+        Create the mission progress monitoring panel.
+        Shows current waypoint, distance, ETA, and overall progress.
+        Phase 2.2 feature.
+        """
+        self.progress_group = QGroupBox("Mission Progress")
+        layout = QVBoxLayout()
+        
+        # Status line - which waypoint we're flying to
+        self.progress_status = QLabel("No mission active")
+        font = QFont("Arial", 11)
+        font.setBold(True)
+        self.progress_status.setFont(font)
+        self.progress_status.setStyleSheet("color: #333333;")
+        layout.addWidget(self.progress_status)
+        
+        # Add some spacing
+        layout.addSpacing(10)
+        
+        # Metrics row - distance and ETA side by side
+        metrics_layout = QHBoxLayout()
+        
+        self.distance_label = QLabel("Distance: --")
+        self.distance_label.setFont(QFont("Arial", 12))
+        self.distance_label.setStyleSheet("color: #0066CC;")
+        metrics_layout.addWidget(self.distance_label)
+        
+        metrics_layout.addStretch()
+        
+        self.eta_label = QLabel("ETA: --")
+        self.eta_label.setFont(QFont("Arial", 12))
+        self.eta_label.setStyleSheet("color: #009900;")
+        metrics_layout.addWidget(self.eta_label)
+        
+        layout.addLayout(metrics_layout)
+        
+        # Add spacing
+        layout.addSpacing(10)
+        
+        # Progress bar with label
+        progress_label = QLabel("Mission Progress")
+        layout.addWidget(progress_label)
+        
+        self.mission_progress_bar = QProgressBar()
+        self.mission_progress_bar.setMinimum(0)
+        self.mission_progress_bar.setMaximum(100)
+        self.mission_progress_bar.setValue(0)
+        self.mission_progress_bar.setTextVisible(True)
+        self.mission_progress_bar.setFormat("%p%")
+        self.mission_progress_bar.setFixedHeight(25)
+        
+        # Style the progress bar
+        self.mission_progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #BDBDBD;
+                border-radius: 3px;
+                background-color: #E0E0E0;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+            }
+        """)
+        
+        layout.addWidget(self.mission_progress_bar)
+        
+        # Add spacing
+        layout.addSpacing(10)
+        
+        # Next waypoint info
+        self.next_wp_label = QLabel("Upload a mission to begin")
+        font_italic = QFont("Arial", 10)
+        font_italic.setItalic(True)
+        self.next_wp_label.setFont(font_italic)
+        self.next_wp_label.setStyleSheet("color: #666666;")
+        layout.addWidget(self.next_wp_label)
+        
+        self.progress_group.setLayout(layout)
+        return self.progress_group
+    
+    def update_mission_progress(self, telemetry_data: dict):
+        """
+        Update mission progress display from telemetry.
+        Phase 2.2 feature.
+        
+        Args:
+            telemetry_data: Dictionary with keys:
+                - current_position: (lat, lon, alt) tuple
+                - current_seq: Current waypoint sequence
+                - ground_speed: Speed in m/s
+                - mode: Current flight mode
+        """
+        # ULTRA DEBUG
+        received_speed = telemetry_data.get('ground_speed')
+        print(f"!!! MISSION_CONTROL_PANEL: Received ground_speed = {received_speed} m/s !!!")
+        
+        # Check if mission exists
+        if not self.waypoints or len(self.waypoints) == 0:
+            self._clear_mission_progress()
+            return
+        
+        # Extract data
+        current_pos = telemetry_data.get('current_position')
+        current_seq = telemetry_data.get('current_seq')
+        ground_speed = telemetry_data.get('ground_speed')
+        mode = telemetry_data.get('mode', 'UNKNOWN')
+        
+        # Debug logging for ground speed
+        logger.info(f"Mission progress update - Speed: {ground_speed} m/s, Seq: {current_seq}, Mode: {mode}")
+        
+        # Handle None ground_speed explicitly
+        if ground_speed is None:
+            ground_speed = 0
+            logger.warning("Ground speed is None, defaulting to 0")
+        
+        # Validate data
+        if current_pos is None:
+            return
+        
+        # Default current_seq to 0 if not provided (hasn't started yet)
+        if current_seq is None:
+            if mode == 'AUTO':
+                current_seq = 0
+            else:
+                self._clear_mission_progress()
+                return
+        
+        current_lat, current_lon, current_alt = current_pos
+        total_waypoints = len(self.waypoints)
+        
+        # Update status based on mission state
+        if current_seq < total_waypoints:
+            self.progress_status.setText(f"Flying to Waypoint {current_seq + 1} of {total_waypoints}")
+            
+            # Get target waypoint
+            target_wp = self.waypoints[current_seq]
+            
+            # Calculate distance using haversine formula
+            distance_m = self._haversine(current_lat, current_lon, target_wp.lat, target_wp.lon)
+            
+            # Format distance display
+            if distance_m > 1000:
+                distance_str = f"{distance_m / 1000:.1f} km"
+            else:
+                distance_str = f"{int(distance_m)} m"
+            self.distance_label.setText(f"Distance: {distance_str}")
+            
+            # Calculate and format ETA
+            eta_seconds = self._calculate_eta(distance_m, ground_speed)
+            eta_str = self._format_eta(eta_seconds)
+            self.eta_label.setText(f"ETA: {eta_str}")
+            
+            # Update progress bar (waypoints completed / total)
+            progress_pct = (current_seq / total_waypoints) * 100
+            self.mission_progress_bar.setValue(int(progress_pct))
+            
+            # Update next waypoint info
+            self.next_wp_label.setText(
+                f"Next: WP{current_seq + 1} @ ({target_wp.lat:.4f}, {target_wp.lon:.4f}, {target_wp.alt:.0f}m)"
+            )
+        else:
+            # Mission complete
+            self.progress_status.setText(f"Mission Complete ({total_waypoints} waypoints)")
+            self.distance_label.setText("Distance: 0 m")
+            self.eta_label.setText("ETA: Complete")
+            self.mission_progress_bar.setValue(100)
+            self.next_wp_label.setText("All waypoints reached")
+    
+    def _clear_mission_progress(self):
+        """Reset progress display when no mission active. Phase 2.2."""
+        self.progress_status.setText("No mission active")
+        self.distance_label.setText("Distance: --")
+        self.eta_label.setText("ETA: --")
+        self.mission_progress_bar.setValue(0)
+        self.next_wp_label.setText("Upload a mission to begin")
+    
+    def _haversine(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """
+        Calculate great circle distance between two points on Earth.
+        Phase 2.2 calculation.
+        
+        Args:
+            lat1, lon1: Current position (decimal degrees)
+            lat2, lon2: Target position (decimal degrees)
+            
+        Returns:
+            Distance in meters
+        """
+        R = 6371000  # Earth radius in meters
+        
+        # Convert to radians
+        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+        
+        # Haversine formula
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        
+        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+        c = 2 * asin(sqrt(a))
+        
+        return R * c
+    
+    def _calculate_eta(self, distance_m: float, ground_speed_ms: float) -> float:
+        """
+        Calculate estimated time to reach target.
+        Phase 2.2 calculation.
+        
+        Args:
+            distance_m: Distance to target in meters
+            ground_speed_ms: Current ground speed in m/s
+            
+        Returns:
+            ETA in seconds, or -1 if speed too low
+        """
+        MIN_SPEED = 1.0  # m/s - below this, ETA unreliable
+        
+        if ground_speed_ms < MIN_SPEED:
+            return -1  # Signal that ETA is not available
+        
+        eta_seconds = distance_m / ground_speed_ms
+        return eta_seconds
+    
+    def _format_eta(self, eta_seconds: float) -> str:
+        """
+        Format ETA for human-readable display.
+        Phase 2.2 helper.
+        
+        Args:
+            eta_seconds: Estimated time in seconds (or -1 if unavailable)
+            
+        Returns:
+            Formatted string like "45s", "2.5min", or "1.2hr"
+        """
+        if eta_seconds < 0:
+            return "--"
+        
+        if eta_seconds < 60:
+            # Less than 60 seconds - show as seconds
+            return f"{int(eta_seconds)}s"
+        elif eta_seconds < 3600:
+            # Less than 60 minutes - show as minutes
+            minutes = eta_seconds / 60
+            return f"{minutes:.1f}min"
+        else:
+            # 60+ minutes - show as hours
+            hours = eta_seconds / 3600
+            return f"{hours:.1f}hr"
+    
+    def set_mavlink_bridge(self, bridge):
+        """
+        Connect to MAVLink bridge for telemetry updates.
+        Phase 2.2 integration.
+        
+        Args:
+            bridge: MAVLinkBridge instance
+        """
+        self.mavlink_bridge = bridge
+        
+        # Connect telemetry signal to update method
+        if hasattr(bridge, 'telemetry_updated'):
+            bridge.telemetry_updated.connect(self._on_telemetry_updated)
+            logger.info("Mission progress connected to telemetry stream")
+    
+    def _on_telemetry_updated(self):
+        """
+        Process telemetry and update mission progress.
+        Phase 2.2 signal handler.
+        """
+        if not self.mavlink_bridge:
+            return
+        
+        # Gather required data from mavlink_bridge
+        telemetry_data = {
+            'current_position': getattr(self.mavlink_bridge, 'current_position', None),
+            'current_seq': getattr(self.mavlink_bridge, 'current_seq', None),
+            'ground_speed': getattr(self.mavlink_bridge, 'ground_speed', 0),
+            'mode': getattr(self.mavlink_bridge, 'mode', 'UNKNOWN')
+        }
+        
+        self.update_mission_progress(telemetry_data)
     
     def on_map_click(self, event):
         """Handle map click to add waypoint"""

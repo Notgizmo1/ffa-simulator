@@ -154,6 +154,35 @@ class MainWindow(QMainWindow):
             
             # Update current position
             self.mission_control_panel.update_current_position(lat, lon)
+        
+        # Update mission progress panel (Phase 2.2)
+        self._update_mission_progress(telemetry)
+    
+    def _update_mission_progress(self, telemetry):
+        """
+        Update mission progress panel with telemetry data.
+        Phase 2.2 feature.
+        """
+        # ULTRA DEBUG - Print to console with print() to bypass logging
+        speed_from_telemetry = telemetry['groundspeed']
+        print(f"!!! MAIN_WINDOW: groundspeed from telemetry dict = {speed_from_telemetry} m/s !!!")
+        
+        # Prepare data for mission progress panel
+        progress_data = {
+            'current_position': (
+                telemetry['latitude'],
+                telemetry['longitude'],
+                telemetry['altitude']
+            ),
+            'current_seq': telemetry.get('current_seq'),
+            'ground_speed': telemetry['groundspeed'],
+            'mode': telemetry['mode']
+        }
+        
+        print(f"!!! MAIN_WINDOW: progress_data['ground_speed'] = {progress_data['ground_speed']} m/s !!!")
+        
+        # Update the mission progress display
+        self.mission_control_panel.update_mission_progress(progress_data)
     
     def upload_mission(self, waypoints):
         """Upload mission to autopilot"""

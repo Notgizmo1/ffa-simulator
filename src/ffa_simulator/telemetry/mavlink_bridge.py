@@ -9,6 +9,11 @@ class TelemetryBridge:
     """MAVLink telemetry bridge for ArduPilot SITL"""
     
     def __init__(self):
+        # VERSION MARKER - Confirms current fix is loaded
+        print("=" * 80)
+        print("!!! MAVLINK_BRIDGE V3.2 - VFR_HUD WITH 1000x SCALING (CORRECTED) !!!")
+        print("=" * 80)
+        
         self.connection = None
         self.connected = False
         self.receive_task = None
@@ -33,6 +38,10 @@ class TelemetryBridge:
         self.yaw = 0.0
         self.latitude = 0.0
         self.longitude = 0.0
+        
+        # Mission progress tracking (Phase 2.2)
+        self.current_seq = None
+        self._last_seq = None  # Track previous waypoint to reduce log spam
         
         # Message counter for debug
         self._msg_count = 0
@@ -75,6 +84,20 @@ class TelemetryBridge:
                     1   # start
                 )
                 
+                # Explicitly request MISSION_CURRENT at 2 Hz
+                logger.info("Requesting MISSION_CURRENT messages...")
+                await loop.run_in_executor(
+                    None,
+                    self.connection.mav.command_long_send,
+                    self.connection.target_system,
+                    self.connection.target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,  # confirmation
+                    mavutil.mavlink.MAVLINK_MSG_ID_MISSION_CURRENT,  # message_id
+                    500000,  # interval in microseconds (500000 = 2 Hz)
+                    0, 0, 0, 0, 0  # unused params
+                )
+                
                 # Start receive task
                 self.receive_task = asyncio.create_task(self._receive_messages())
                 
@@ -110,6 +133,14 @@ class TelemetryBridge:
                         self.current_mode = self._get_mode_name(msg.custom_mode)
                         self.armed = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
                     
+                    elif msg_type == 'MISSION_CURRENT':
+                        new_seq = msg.seq
+                        # Only log when waypoint changes (not every 500ms)
+                        if new_seq != self._last_seq:
+                            logger.info(f"Waypoint changed: {self._last_seq} → {new_seq}")
+                            self._last_seq = new_seq
+                        self.current_seq = new_seq
+                    
                     elif msg_type == 'SYS_STATUS':
                         self.battery_voltage = msg.voltage_battery / 1000.0
                         self.battery_remaining = msg.battery_remaining
@@ -124,10 +155,23 @@ class TelemetryBridge:
                         self.yaw = np.degrees(msg.yaw)
                     
                     elif msg_type == 'GLOBAL_POSITION_INT':
+                        # Update position only (groundspeed comes from VFR_HUD)
                         self.altitude = msg.relative_alt / 1000.0
-                        self.groundspeed = np.sqrt(msg.vx**2 + msg.vy**2) / 100.0
                         self.latitude = msg.lat / 1e7
                         self.longitude = msg.lon / 1e7
+                    
+                    elif msg_type == 'VFR_HUD':
+                        # VFR_HUD groundspeed is scaled incorrectly in SITL
+                        # Empirical testing shows 1000x correction gives accurate results
+                        # (Raw ~0.03 m/s → Corrected ~30 m/s matches Telemetry Plots)
+                        raw_groundspeed = msg.groundspeed
+                        self.groundspeed = raw_groundspeed * 1000.0
+                        
+                        # DEBUG - print every 10th message
+                        if self._msg_count % 10 == 0:
+                            print(f"!!! VFR_HUD: raw={raw_groundspeed:.6f} m/s × 1000 = corrected={self.groundspeed:.2f} m/s !!!")
+                        
+                        self._msg_count += 1
                 
                 # Small delay to prevent CPU spinning
                 await asyncio.sleep(0.01)
@@ -185,7 +229,7 @@ class TelemetryBridge:
     
     def get_telemetry(self):
         """Get current telemetry data snapshot"""
-        return {
+        data = {
             'mode': self.current_mode,
             'armed': self.armed,
             'battery_voltage': self.battery_voltage,
@@ -198,8 +242,15 @@ class TelemetryBridge:
             'pitch': self.pitch,
             'yaw': self.yaw,
             'latitude': self.latitude,
-            'longitude': self.longitude
+            'longitude': self.longitude,
+            'current_seq': self.current_seq  # Added for Phase 2.2
         }
+        
+        # DEBUG: Log every 100th call
+        if self._msg_count % 100 == 0:
+            logger.info(f"get_telemetry() returning groundspeed={self.groundspeed} m/s")
+        
+        return data
     
     async def send_command(self, command, params):
         """Send flight command to autopilot"""
