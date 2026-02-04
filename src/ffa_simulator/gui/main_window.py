@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PySide6.QtCore import Qt, QTimer
 from ffa_simulator.orchestrator.process_manager import ProcessManager
 from ffa_simulator.telemetry.mavlink_bridge import TelemetryBridge
+from ffa_simulator.gui.telemetry_panel import TelemetryPanel
 
 logger = logging.getLogger(__name__)
 
@@ -112,63 +113,17 @@ class MainWindow(QMainWindow):
         return panel
     
     def create_telemetry_panel(self):
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        
-        telemetry_label = QLabel("Telemetry Display Area")
-        telemetry_label.setStyleSheet("border: 2px dashed #ccc; padding: 20px;")
-        telemetry_label.setAlignment(Qt.AlignCenter)
-        telemetry_label.setMinimumHeight(400)
-        layout.addWidget(telemetry_label)
-        
-        status_layout = QHBoxLayout()
-        self.mode_label = QLabel("Mode: --")
-        self.armed_label = QLabel("Armed: No")
-        self.battery_label = QLabel("Battery: --")
-        self.gps_label = QLabel("GPS: --")
-        
-        for label in [self.mode_label, self.armed_label, self.battery_label, self.gps_label]:
-            label.setStyleSheet("padding: 5px; background-color: #f0f0f0; border-radius: 3px;")
-            status_layout.addWidget(label)
-        
-        layout.addLayout(status_layout)
-        
-        return panel
+        """Create PyQtGraph telemetry visualization panel"""
+        self.telemetry_panel = TelemetryPanel()
+        return self.telemetry_panel
     
     def update_telemetry_display(self):
-        """Update telemetry labels with current data"""
+        """Update telemetry panel with current data"""
         if not self.telemetry_bridge.connected:
             return
         
         telemetry = self.telemetry_bridge.get_telemetry()
-        
-        self.mode_label.setText(f"Mode: {telemetry['mode']}")
-        
-        if telemetry['armed']:
-            self.armed_label.setText("Armed: YES")
-            self.armed_label.setStyleSheet("padding: 5px; background-color: #ff6b6b; color: white; border-radius: 3px; font-weight: bold;")
-        else:
-            self.armed_label.setText("Armed: No")
-            self.armed_label.setStyleSheet("padding: 5px; background-color: #f0f0f0; border-radius: 3px;")
-        
-        voltage = telemetry['battery_voltage']
-        remaining = telemetry['battery_remaining']
-        if voltage > 0:
-            self.battery_label.setText(f"Battery: {voltage:.1f}V ({remaining}%)")
-        else:
-            self.battery_label.setText("Battery: --")
-        
-        fix_type = telemetry['gps_fix']
-        sats = telemetry['gps_satellites']
-        if fix_type >= 3:
-            self.gps_label.setText(f"GPS: 3D Fix ({sats} sats)")
-            self.gps_label.setStyleSheet("padding: 5px; background-color: #51cf66; color: white; border-radius: 3px;")
-        elif fix_type > 0:
-            self.gps_label.setText(f"GPS: No Fix ({sats} sats)")
-            self.gps_label.setStyleSheet("padding: 5px; background-color: #ffd43b; color: black; border-radius: 3px;")
-        else:
-            self.gps_label.setText("GPS: --")
-            self.gps_label.setStyleSheet("padding: 5px; background-color: #f0f0f0; border-radius: 3px;")
+        self.telemetry_panel.update_display(telemetry)
     
     def start_simulation(self):
         logger.info("Ready for simulation")
@@ -224,18 +179,12 @@ class MainWindow(QMainWindow):
         
         self.stop_button.setEnabled(False)
         self.telemetry_timer.stop()
+        self.telemetry_panel.reset()
         
         async def stop_async():
             try:
                 await self.telemetry_bridge.disconnect()
                 await self.process_manager.stop_simulation()
-                
-                self.mode_label.setText("Mode: --")
-                self.armed_label.setText("Armed: No")
-                self.armed_label.setStyleSheet("padding: 5px; background-color: #f0f0f0; border-radius: 3px;")
-                self.battery_label.setText("Battery: --")
-                self.gps_label.setText("GPS: --")
-                self.gps_label.setStyleSheet("padding: 5px; background-color: #f0f0f0; border-radius: 3px;")
                 
                 self.start_button.setEnabled(True)
                 self.stop_button.setEnabled(False)
