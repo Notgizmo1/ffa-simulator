@@ -2,11 +2,25 @@ import logging
 import asyncio
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                 QPushButton, QLabel, QComboBox, QTextEdit, QSplitter)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QMetaObject
 from ffa_simulator.orchestrator.process_manager import ProcessManager
 from ffa_simulator.telemetry.mavlink_bridge import TelemetryBridge
 
 logger = logging.getLogger(__name__)
+
+class LogHandler(logging.Handler):
+    """Custom handler to route Python logs to GUI QTextEdit"""
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+        
+    def emit(self, record):
+        msg = self.format(record)
+        # Simple direct append (thread-safe in Qt)
+        try:
+            self.text_widget.append(msg)
+        except:
+            pass  # Ignore if widget destroyed
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -14,6 +28,7 @@ class MainWindow(QMainWindow):
         self.process_manager = ProcessManager()
         self.telemetry_bridge = None
         self.init_ui()
+        self.setup_logging()
         
     def init_ui(self):
         self.setWindowTitle("FFA Simulator - ArduPilot VTOL Training")
@@ -35,6 +50,22 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(splitter)
         
         logger.info("Main window UI initialized")
+    
+    def setup_logging(self):
+        """Connect Python logging to GUI log display"""
+        gui_handler = LogHandler(self.log_display)
+        gui_handler.setLevel(logging.INFO)
+        
+        # Format: timestamp | level | message
+        formatter = logging.Formatter('%(asctime)s | %(levelname)-5s | %(message)s', 
+                                     datefmt='%H:%M:%S')
+        gui_handler.setFormatter(formatter)
+        
+        # Add to root logger so ALL modules log to GUI
+        root_logger = logging.getLogger()
+        root_logger.addHandler(gui_handler)
+        
+        logger.info("GUI logging initialized")
     
     def create_control_panel(self):
         panel = QWidget()
@@ -104,8 +135,7 @@ class MainWindow(QMainWindow):
         return panel
     
     def start_simulation(self):
-        logger.info("Starting simulation...")
-        self.log_display.append("▶ Starting simulation...")
+        logger.info("Ready for simulation")
         
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(False)
@@ -120,18 +150,15 @@ class MainWindow(QMainWindow):
         
         async def start_async():
             try:
-                self.log_display.append("✓ Connecting to Docker...")
                 await self.process_manager.start_simulation(vehicle, scenario)
                 
                 self.start_button.setEnabled(False)
                 self.stop_button.setEnabled(True)
                 self.status_label.setText("Status: Running")
                 self.status_label.setStyleSheet("padding: 10px; background-color: #51cf66; color: white; border-radius: 5px;")
-                self.log_display.append("✓ Simulation running!")
                 
             except Exception as e:
                 logger.error(f"Failed to start simulation: {e}")
-                self.log_display.append(f"✗ Error: {str(e)}")
                 
                 self.start_button.setEnabled(True)
                 self.stop_button.setEnabled(False)
@@ -144,7 +171,6 @@ class MainWindow(QMainWindow):
     
     def stop_simulation(self):
         logger.info("Stopping simulation...")
-        self.log_display.append("■ Stopping simulation...")
         
         self.stop_button.setEnabled(False)
         
@@ -158,11 +184,9 @@ class MainWindow(QMainWindow):
                 self.scenario_combo.setEnabled(True)
                 self.status_label.setText("Status: Stopped")
                 self.status_label.setStyleSheet("padding: 10px; background-color: #ff6b6b; color: white; border-radius: 5px;")
-                self.log_display.append("✓ Simulation stopped")
                 
             except Exception as e:
                 logger.error(f"Error stopping simulation: {e}")
-                self.log_display.append(f"✗ Error: {str(e)}")
                 self.stop_button.setEnabled(True)
         
         asyncio.create_task(stop_async())
