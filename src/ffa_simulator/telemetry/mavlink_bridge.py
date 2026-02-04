@@ -96,8 +96,6 @@ class TelemetryBridge:
                     if msg_type == 'HEARTBEAT':
                         self.current_mode = self._get_mode_name(msg.custom_mode)
                         self.armed = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
-                        if self._msg_count == 1:
-                            logger.info(f"Mode: {self.current_mode}, Armed: {self.armed}")
                     
                     elif msg_type == 'SYS_STATUS':
                         self.battery_voltage = msg.voltage_battery / 1000.0
@@ -154,6 +152,24 @@ class TelemetryBridge:
         }
         return mode_map.get(custom_mode, f"MODE_{custom_mode}")
     
+    def _get_mode_number(self, mode_name):
+        """Convert mode name to ArduPlane custom mode number"""
+        mode_map = {
+            "MANUAL": 0,
+            "STABILIZE": 2,
+            "FBWA": 5,
+            "AUTO": 10,
+            "RTL": 11,
+            "LOITER": 12,
+            "GUIDED": 15,
+            "QSTABILIZE": 17,
+            "QHOVER": 18,
+            "QLOITER": 19,
+            "QLAND": 20,
+            "QRTL": 21
+        }
+        return mode_map.get(mode_name.upper(), None)
+    
     def get_telemetry(self):
         """Get current telemetry data snapshot"""
         return {
@@ -171,6 +187,187 @@ class TelemetryBridge:
             'latitude': self.latitude,
             'longitude': self.longitude
         }
+    
+    async def send_command(self, command, params):
+        """Send flight command to autopilot"""
+        if not self.connected:
+            logger.error("Cannot send command - not connected")
+            return False
+        
+        try:
+            if command == "ARM":
+                return await self._arm()
+            elif command == "DISARM":
+                return await self._disarm()
+            elif command == "TAKEOFF":
+                altitude = params.get("altitude", 50)
+                return await self._takeoff(altitude)
+            elif command == "RTL":
+                return await self._set_mode("RTL")
+            elif command == "LAND":
+                return await self._set_mode("QLAND")
+            elif command == "AUTO":
+                return await self._set_mode("AUTO")
+            else:
+                logger.warning(f"Unknown command: {command}")
+                return False
+        except Exception as e:
+            logger.error(f"Command execution failed: {e}")
+            return False
+    
+    async def _arm(self):
+        """Arm the vehicle"""
+        logger.info("Sending ARM command...")
+        
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self.connection.arducopter_arm
+        )
+        
+        logger.info("ARM command sent")
+        return True
+    
+    async def _disarm(self):
+        """Disarm the vehicle"""
+        logger.info("Sending DISARM command...")
+        
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self.connection.arducopter_disarm
+        )
+        
+        logger.info("DISARM command sent")
+        return True
+    
+    async def _set_mode(self, mode_name):
+        """Set flight mode"""
+        mode_num = self._get_mode_number(mode_name)
+        if mode_num is None:
+            logger.error(f"Invalid mode: {mode_name}")
+            return False
+        
+        logger.info(f"Setting mode to {mode_name}...")
+        
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self.connection.set_mode,
+            mode_num
+        )
+        
+        logger.info(f"Mode change to {mode_name} sent")
+        return True
+    
+    async def _takeoff(self, altitude):
+        """Command VTOL takeoff"""
+        logger.info(f"Commanding takeoff to {altitude}m...")
+        
+        # First switch to QLOITER mode
+        await self._set_mode("QLOITER")
+        await asyncio.sleep(0.5)
+        
+        # Then send takeoff command
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self.connection.mav.command_long_send,
+            self.connection.target_system,
+            self.connection.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0,  # confirmation
+            0, 0, 0, 0,  # params 1-4
+            0, 0,  # lat, lon (0 = current position)
+            altitude  # altitude
+        )
+        
+        logger.info(f"Takeoff command sent (target: {altitude}m)")
+        return True
+    
+    async def upload_mission(self, waypoints):
+        """Upload waypoint mission to autopilot"""
+        if not self.connected:
+            logger.error("Cannot upload mission - not connected")
+            return False
+        
+        try:
+            logger.info(f"Uploading mission with {len(waypoints)} waypoints...")
+            
+            # Clear existing mission
+            loop = asyncio.get_event_loop()
+            
+            # Send mission count
+            await loop.run_in_executor(
+                None,
+                self.connection.waypoint_clear_all_send
+            )
+            
+            await asyncio.sleep(0.5)
+            
+            # Upload waypoints
+            mission_items = []
+            
+            # Item 0: Home position (required)
+            mission_items.append(mavutil.mavlink.MAVLink_mission_item_message(
+                self.connection.target_system,
+                self.connection.target_component,
+                0,  # seq
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                0,  # current (0 for all waypoints except first)
+                1,  # autocontinue
+                0, 0, 0, 0,  # params 1-4
+                self.latitude if self.latitude != 0 else 0,
+                self.longitude if self.longitude != 0 else 0,
+                0  # altitude (home is 0)
+            ))
+            
+            # Add user waypoints
+            for i, wp in enumerate(waypoints):
+                mission_items.append(mavutil.mavlink.MAVLink_mission_item_message(
+                    self.connection.target_system,
+                    self.connection.target_component,
+                    i + 1,  # seq (starts at 1 after home)
+                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                    mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                    0,  # current
+                    1,  # autocontinue
+                    wp.loiter_time,  # param1 (hold time)
+                    wp.acceptance_radius,  # param2
+                    0, 0,  # params 3-4
+                    wp.lat,
+                    wp.lon,
+                    wp.alt
+                ))
+            
+            # Send mission count
+            total_items = len(mission_items)
+            await loop.run_in_executor(
+                None,
+                self.connection.mav.mission_count_send,
+                self.connection.target_system,
+                self.connection.target_component,
+                total_items
+            )
+            
+            await asyncio.sleep(0.5)
+            
+            # Send each mission item
+            for item in mission_items:
+                await loop.run_in_executor(
+                    None,
+                    self.connection.mav.send,
+                    item
+                )
+                await asyncio.sleep(0.1)
+            
+            logger.info(f"Mission uploaded successfully ({total_items} items)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Mission upload failed: {e}", exc_info=True)
+            return False
     
     async def disconnect(self):
         """Disconnect from MAVLink"""

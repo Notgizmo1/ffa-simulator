@@ -1,11 +1,13 @@
 import logging
 import asyncio
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                                QPushButton, QLabel, QComboBox, QTextEdit, QSplitter)
+                                QPushButton, QLabel, QComboBox, QTextEdit, QSplitter,
+                                QTabWidget)
 from PySide6.QtCore import Qt, QTimer
 from ffa_simulator.orchestrator.process_manager import ProcessManager
 from ffa_simulator.telemetry.mavlink_bridge import TelemetryBridge
 from ffa_simulator.gui.telemetry_panel import TelemetryPanel
+from ffa_simulator.gui.mission_control_panel import MissionControlPanel
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +35,7 @@ class MainWindow(QMainWindow):
         
     def init_ui(self):
         self.setWindowTitle("FFA Simulator - ArduPilot VTOL Training")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setGeometry(100, 100, 1600, 900)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -41,12 +43,12 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout(central_widget)
         
         left_panel = self.create_control_panel()
-        right_panel = self.create_telemetry_panel()
+        right_panel = self.create_right_panel()
         
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setSizes([400, 1000])
+        splitter.setSizes([400, 1200])
         
         main_layout.addWidget(splitter)
         
@@ -105,17 +107,30 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("\nSystem Log:"))
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
-        self.log_display.setMaximumHeight(200)
+        self.log_display.setMaximumHeight(300)
         layout.addWidget(self.log_display)
         
         layout.addStretch()
         
         return panel
     
-    def create_telemetry_panel(self):
-        """Create PyQtGraph telemetry visualization panel"""
+    def create_right_panel(self):
+        """Create tabbed interface for Mission Control and Telemetry"""
+        tab_widget = QTabWidget()
+        
+        # Tab 1: Mission Control
+        self.mission_control_panel = MissionControlPanel()
+        tab_widget.addTab(self.mission_control_panel, "Mission Control")
+        
+        # Tab 2: Telemetry
         self.telemetry_panel = TelemetryPanel()
-        return self.telemetry_panel
+        tab_widget.addTab(self.telemetry_panel, "Telemetry Plots")
+        
+        # Connect mission control signals
+        self.mission_control_panel.mission_upload_requested.connect(self.upload_mission)
+        self.mission_control_panel.command_requested.connect(self.send_command)
+        
+        return tab_widget
     
     def update_telemetry_display(self):
         """Update telemetry panel with current data"""
@@ -123,7 +138,54 @@ class MainWindow(QMainWindow):
             return
         
         telemetry = self.telemetry_bridge.get_telemetry()
+        
+        # Update telemetry plots
         self.telemetry_panel.update_display(telemetry)
+        
+        # Update mission control with current position
+        lat = telemetry['latitude']
+        lon = telemetry['longitude']
+        
+        if lat != 0 and lon != 0:
+            # Set home position on first valid GPS
+            if self.mission_control_panel.home_position is None:
+                self.mission_control_panel.set_home_position(lat, lon)
+                logger.info(f"Home position set: {lat:.6f}, {lon:.6f}")
+            
+            # Update current position
+            self.mission_control_panel.update_current_position(lat, lon)
+    
+    def upload_mission(self, waypoints):
+        """Upload mission to autopilot"""
+        logger.info(f"Uploading {len(waypoints)} waypoints to autopilot...")
+        
+        async def upload_async():
+            try:
+                success = await self.telemetry_bridge.upload_mission(waypoints)
+                if success:
+                    logger.info("Mission uploaded successfully!")
+                else:
+                    logger.error("Mission upload failed")
+            except Exception as e:
+                logger.error(f"Mission upload error: {e}")
+        
+        asyncio.create_task(upload_async())
+    
+    def send_command(self, command, params):
+        """Send flight command to autopilot"""
+        logger.info(f"Sending command: {command} with params: {params}")
+        
+        async def command_async():
+            try:
+                success = await self.telemetry_bridge.send_command(command, params)
+                if success:
+                    logger.info(f"Command {command} sent successfully")
+                else:
+                    logger.warning(f"Command {command} failed")
+            except Exception as e:
+                logger.error(f"Command error: {e}")
+        
+        asyncio.create_task(command_async())
     
     def start_simulation(self):
         logger.info("Ready for simulation")
@@ -153,10 +215,10 @@ class MainWindow(QMainWindow):
                 connected = await self.telemetry_bridge.connect(connection_string)
                 
                 if connected:
-                    logger.info("✓ Telemetry connected")
+                    logger.info("Telemetry connected")
                     self.telemetry_timer.start()
                 else:
-                    logger.warning("⚠ Telemetry connection failed")
+                    logger.warning("Telemetry connection failed")
                 
                 self.start_button.setEnabled(False)
                 self.stop_button.setEnabled(True)
