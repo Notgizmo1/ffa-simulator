@@ -32,7 +32,7 @@ class ProcessManager:
         result = stdout.decode('utf-8', errors='ignore').strip()
         
         if "EXISTS" in result:
-            logger.info("✓ ArduPilot SITL already built")
+            logger.info("[OK] ArduPilot SITL already built")
             self.sitl_built = True
             return True
         
@@ -61,7 +61,7 @@ class ProcessManager:
         await build_proc.wait()
         
         if build_proc.returncode == 0:
-            logger.info("✓ ArduPilot built successfully")
+            logger.info("[OK] ArduPilot built successfully")
             self.sitl_built = True
             return True
         else:
@@ -83,14 +83,13 @@ class ProcessManager:
             
             frame = vehicle_map.get(vehicle_type, "quadplane")
             
-            # SITL command - bind to 0.0.0.0:14550 for Windows access
+            # SITL command - use defaults which starts MAVProxy broadcasting UDP to Windows
             sitl_cmd = [
                 "wsl", "-e", "bash", "-c",
                 f"cd ~/ardupilot && python3 ./Tools/autotest/sim_vehicle.py "
                 f"-v ArduPlane "
                 f"-f {frame} "
                 f"--no-rebuild "
-                f"--no-mavproxy "
                 f"--speedup 1 "
                 f"-I0 "
                 f"2>&1"
@@ -98,7 +97,7 @@ class ProcessManager:
             
             logger.info("Launching ArduPilot SITL...")
             logger.info(f"Vehicle: ArduPlane, Frame: {frame}")
-            logger.info("MAVLink will be available at default port 5760")
+            logger.info("MAVProxy will broadcast UDP to Windows on port 14550")
             
             self.processes['sitl'] = await asyncio.create_subprocess_exec(
                 *sitl_cmd,
@@ -107,7 +106,7 @@ class ProcessManager:
                 stdin=asyncio.subprocess.PIPE
             )
             
-            logger.info(f"✓ SITL process started (PID: {self.processes['sitl'].pid})")
+            logger.info(f"[OK] SITL process started (PID: {self.processes['sitl'].pid})")
             
             self.log_task = asyncio.create_task(self._monitor_logs())
             
@@ -115,8 +114,8 @@ class ProcessManager:
             
             self.running = True
             logger.info("=" * 60)
-            logger.info("✓ SIMULATION READY")
-            logger.info("MAVLink: tcp:0.0.0.0:14550 (accessible from Windows)")
+            logger.info("[OK] SIMULATION READY")
+            logger.info("MAVLink: udpin:0.0.0.0:14550 (MAVProxy UDP broadcast)")
             logger.info("=" * 60)
             return True
             
@@ -169,10 +168,17 @@ class ProcessManager:
             if proc.returncode is not None:
                 try:
                     remaining = await proc.stdout.read()
-                    error_output = remaining.decode('utf-8', errors='replace')[:500]
-                    logger.error(f"SITL died. Last output: {error_output}")
-                except:
-                    pass
+                    error_output = remaining.decode('utf-8', errors='replace')
+                    # Log last 1000 chars to see actual error
+                    if error_output:
+                        logger.error("=" * 60)
+                        logger.error("SITL CRASHED - Last output:")
+                        logger.error(error_output[-1000:])
+                        logger.error("=" * 60)
+                    else:
+                        logger.error("SITL died but no output captured")
+                except Exception as e:
+                    logger.error(f"Could not read SITL output: {e}")
                 raise RuntimeError(f"SITL died with code {proc.returncode}")
             
             await asyncio.sleep(2)
@@ -181,7 +187,7 @@ class ProcessManager:
             raise RuntimeError("SITL failed to start")
         
         elapsed = asyncio.get_event_loop().time() - start_time
-        logger.info(f"✓ SITL initialized ({elapsed:.1f}s)")
+        logger.info(f"[OK] SITL initialized ({elapsed:.1f}s)")
         return True
     
     async def stop_simulation(self):
@@ -206,12 +212,12 @@ class ProcessManager:
                     
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=5)
-                        logger.info("✓ SITL terminated")
+                        logger.info("[OK] SITL terminated")
                     except asyncio.TimeoutError:
                         logger.warning("Force killing SITL...")
                         proc.kill()
                         await proc.wait()
-                        logger.info("✓ SITL killed")
+                        logger.info("[OK] SITL killed")
                         
                 except ProcessLookupError:
                     logger.info("Process already gone")
@@ -219,7 +225,7 @@ class ProcessManager:
                 del self.processes['sitl']
             
             self.running = False
-            logger.info("✓ Simulation stopped")
+            logger.info("[OK] Simulation stopped")
             
         except Exception as e:
             logger.error(f"Error stopping: {e}")

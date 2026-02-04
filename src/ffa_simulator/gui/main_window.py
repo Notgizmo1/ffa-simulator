@@ -209,7 +209,8 @@ class MainWindow(QMainWindow):
                 await asyncio.sleep(3)
                 
                 wsl_ip = "172.24.119.69"
-                connection_string = f"tcp:{wsl_ip}:5760"
+                # MAVProxy broadcasts UDP to Windows on port 14550
+                connection_string = "udpin:0.0.0.0:14550"
                 
                 logger.info(f"Connecting to MAVLink: {connection_string}")
                 connected = await self.telemetry_bridge.connect(connection_string)

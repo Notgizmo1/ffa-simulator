@@ -52,15 +52,28 @@ class TelemetryBridge:
                 10
             )
             
-            logger.info("Waiting for heartbeat...")
+            logger.info("Waiting for heartbeat (10 second timeout)...")
             heartbeat = await loop.run_in_executor(
                 None,
-                self.connection.wait_heartbeat
+                self.connection.wait_heartbeat,
+                10  # 10 second timeout explicitly set
             )
             
             if heartbeat:
                 logger.info(f"Connected! System {self.connection.target_system}, Component {self.connection.target_component}")
                 self.connected = True
+                
+                # Now request data streams
+                logger.info("Requesting data streams...")
+                await loop.run_in_executor(
+                    None,
+                    self.connection.mav.request_data_stream_send,
+                    self.connection.target_system,
+                    self.connection.target_component,
+                    mavutil.mavlink.MAV_DATA_STREAM_ALL,
+                    4,  # 4 Hz
+                    1   # start
+                )
                 
                 # Start receive task
                 self.receive_task = asyncio.create_task(self._receive_messages())
@@ -68,7 +81,7 @@ class TelemetryBridge:
                 logger.info("Telemetry monitoring started")
                 return True
             else:
-                logger.error("No heartbeat received")
+                logger.error("No heartbeat received after timeout")
                 return False
                 
         except Exception as e:
