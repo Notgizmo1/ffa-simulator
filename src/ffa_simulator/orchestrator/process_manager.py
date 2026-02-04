@@ -1,6 +1,5 @@
 import logging
 import asyncio
-import sys
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +83,7 @@ class ProcessManager:
             
             frame = vehicle_map.get(vehicle_type, "quadplane")
             
-            # Simplified SITL command that works reliably
-            # SITL command WITHOUT MAVProxy (we'll connect via pymavlink directly)
+            # SITL command - bind to 0.0.0.0:14550 for Windows access
             sitl_cmd = [
                 "wsl", "-e", "bash", "-c",
                 f"cd ~/ardupilot && python3 ./Tools/autotest/sim_vehicle.py "
@@ -100,8 +98,8 @@ class ProcessManager:
             
             logger.info("Launching ArduPilot SITL...")
             logger.info(f"Vehicle: ArduPlane, Frame: {frame}")
+            logger.info("MAVLink will be available at default port 5760")
             
-            # Start process
             self.processes['sitl'] = await asyncio.create_subprocess_exec(
                 *sitl_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -111,16 +109,14 @@ class ProcessManager:
             
             logger.info(f"✓ SITL process started (PID: {self.processes['sitl'].pid})")
             
-            # Start log monitoring
             self.log_task = asyncio.create_task(self._monitor_logs())
             
-            # Wait for ready
             await self._wait_for_ready()
             
             self.running = True
             logger.info("=" * 60)
             logger.info("✓ SIMULATION READY")
-            logger.info("MAVLink: tcp:127.0.0.1:5760")
+            logger.info("MAVLink: tcp:0.0.0.0:14550 (accessible from Windows)")
             logger.info("=" * 60)
             return True
             
@@ -141,19 +137,16 @@ class ProcessManager:
                 if not line:
                     break
                 
-                # Decode with error handling for special characters
                 text = line.decode('utf-8', errors='replace').strip()
                 
                 if text:
-                    # Filter for important messages only
                     important_keywords = [
                         'APM:', 'EKF', 'PreArm', 'ARMED', 'DISARMED',
                         'Flight battery', 'GPS', 'Ready to FLY',
-                        'Init', 'STABILIZE', 'Port'
+                        'Init', 'STABILIZE', 'Port', 'Bind port'
                     ]
                     
                     if any(key in text for key in important_keywords):
-                        # Remove special characters that cause encoding issues
                         clean_text = ''.join(c if ord(c) < 128 else ' ' for c in text)
                         logger.info(f"[SITL] {clean_text}")
                     
@@ -171,12 +164,9 @@ class ProcessManager:
             raise RuntimeError("SITL process not found")
         
         start_time = asyncio.get_event_loop().time()
-        ready_found = False
         
         while asyncio.get_event_loop().time() - start_time < timeout:
-            # Check if process died
             if proc.returncode is not None:
-                # Get last output for debugging
                 try:
                     remaining = await proc.stdout.read()
                     error_output = remaining.decode('utf-8', errors='replace')[:500]
@@ -187,7 +177,6 @@ class ProcessManager:
             
             await asyncio.sleep(2)
         
-        # After timeout, check if still alive
         if proc.returncode is not None:
             raise RuntimeError("SITL failed to start")
         
