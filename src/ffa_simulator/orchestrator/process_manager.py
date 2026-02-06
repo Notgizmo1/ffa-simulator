@@ -83,12 +83,32 @@ class ProcessManager:
             
             frame = vehicle_map.get(vehicle_type, "quadplane")
             
-            # SITL command - use defaults which starts MAVProxy broadcasting UDP to Windows
+            # Scenario-specific starting modes (ArduCopter)
+            scenario_config = {
+                "basic_hover": {
+                    "mode": "STABILIZE",  # ArduCopter equivalent of QSTABILIZE
+                    "description": "Multicopter on ground, ready for manual control"
+                },
+                "simple_waypoints": {
+                    "mode": "STABILIZE",
+                    "description": "Multicopter with simple waypoint mission loaded"
+                },
+                "vtol_transition": {
+                    "mode": "STABILIZE", 
+                    "description": "Multicopter for altitude and loiter training"
+                }
+            }
+            
+            config = scenario_config.get(scenario, scenario_config["basic_hover"])
+            logger.info(f"Scenario: {config['description']}")
+            
+            # SITL command - Use ArduCopter for stable VTOL operations
+            # ArduCopter must be built first: wsl bash -c "cd ~/ardupilot && ./waf copter"
             sitl_cmd = [
                 "wsl", "-e", "bash", "-c",
                 f"cd ~/ardupilot && python3 ./Tools/autotest/sim_vehicle.py "
-                f"-v ArduPlane "
-                f"-f {frame} "
+                f"-v ArduCopter "
+                f"-f quad "
                 f"--no-rebuild "
                 f"--speedup 1 "
                 f"-I0 "
@@ -96,7 +116,8 @@ class ProcessManager:
             ]
             
             logger.info("Launching ArduPilot SITL...")
-            logger.info(f"Vehicle: ArduPlane, Frame: {frame}")
+            logger.info(f"Vehicle: ArduCopter (VTOL), Frame: quad")
+            logger.info(f"Starting Mode: {config['mode']}")
             logger.info("MAVProxy will broadcast UDP to Windows on port 14550")
             
             self.processes['sitl'] = await asyncio.create_subprocess_exec(

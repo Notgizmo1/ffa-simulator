@@ -145,6 +145,7 @@ class MainWindow(QMainWindow):
         # Update mission control with current position
         lat = telemetry['latitude']
         lon = telemetry['longitude']
+        alt = telemetry['altitude']
         
         if lat != 0 and lon != 0:
             # Set home position on first valid GPS
@@ -152,37 +153,12 @@ class MainWindow(QMainWindow):
                 self.mission_control_panel.set_home_position(lat, lon)
                 logger.info(f"Home position set: {lat:.6f}, {lon:.6f}")
             
-            # Update current position
+            # Update current position on map
             self.mission_control_panel.update_current_position(lat, lon)
         
-        # Update mission progress panel (Phase 2.2)
-        self._update_mission_progress(telemetry)
-    
-    def _update_mission_progress(self, telemetry):
-        """
-        Update mission progress panel with telemetry data.
-        Phase 2.2 feature.
-        """
-        # ULTRA DEBUG - Print to console with print() to bypass logging
-        speed_from_telemetry = telemetry['groundspeed']
-        print(f"!!! MAIN_WINDOW: groundspeed from telemetry dict = {speed_from_telemetry} m/s !!!")
-        
-        # Prepare data for mission progress panel
-        progress_data = {
-            'current_position': (
-                telemetry['latitude'],
-                telemetry['longitude'],
-                telemetry['altitude']
-            ),
-            'current_seq': telemetry.get('current_seq'),
-            'ground_speed': telemetry['groundspeed'],
-            'mode': telemetry['mode']
-        }
-        
-        print(f"!!! MAIN_WINDOW: progress_data['ground_speed'] = {progress_data['ground_speed']} m/s !!!")
-        
-        # Update the mission progress display
-        self.mission_control_panel.update_mission_progress(progress_data)
+        # Update altitude and position displays (Phase 3.1)
+        self.mission_control_panel.update_altitude_display(alt)
+        self.mission_control_panel.update_position_display(lat, lon)
     
     def upload_mission(self, waypoints):
         """Upload mission to autopilot"""

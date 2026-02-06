@@ -1,13 +1,10 @@
 import logging
 import numpy as np
-from math import radians, cos, sin, asin, sqrt
 from collections import deque
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                 QPushButton, QListWidget, QSpinBox, QDoubleSpinBox,
-                                QGroupBox, QGridLayout, QFileDialog, QMessageBox,
-                                QProgressBar)
+                                QGroupBox, QGridLayout, QFileDialog, QMessageBox)
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
 import pyqtgraph as pg
 
 logger = logging.getLogger(__name__)
@@ -38,7 +35,6 @@ class MissionControlPanel(QWidget):
         self.waypoints = []
         self.current_waypoint_index = -1
         self.home_position = None  # (lat, lon)
-        self.mavlink_bridge = None  # Will be set externally
         
         self.init_ui()
         
@@ -49,6 +45,10 @@ class MissionControlPanel(QWidget):
         # Top: Flight controls
         controls = self.create_flight_controls()
         layout.addWidget(controls)
+        
+        # Altitude Controls (Phase 3.1)
+        altitude_controls = self.create_altitude_controls()
+        layout.addWidget(altitude_controls)
         
         # Middle: Map and waypoint list (side by side)
         middle_layout = QHBoxLayout()
@@ -63,10 +63,6 @@ class MissionControlPanel(QWidget):
         
         layout.addLayout(middle_layout)
         
-        # Bottom: Mission Progress panel (NEW - Phase 2.2)
-        progress_panel = self._create_mission_progress_panel()
-        layout.addWidget(progress_panel)
-        
         logger.info("Mission control panel initialized")
     
     def create_flight_controls(self):
@@ -78,6 +74,12 @@ class MissionControlPanel(QWidget):
         self.arm_button.setStyleSheet("background-color: #ff6b6b; color: white; font-weight: bold; padding: 10px;")
         self.arm_button.clicked.connect(lambda: self.send_command("ARM"))
         layout.addWidget(self.arm_button)
+        
+        # Force ARM button for SITL (bypasses PreArm checks)
+        self.force_arm_button = QPushButton("FORCE ARM (SITL)")
+        self.force_arm_button.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold; padding: 10px; border: 2px solid #a71d2a;")
+        self.force_arm_button.clicked.connect(lambda: self.send_command("ARM_FORCE"))
+        layout.addWidget(self.force_arm_button)
         
         self.disarm_button = QPushButton("DISARM")
         self.disarm_button.setStyleSheet("background-color: #51cf66; color: white; font-weight: bold; padding: 10px;")
@@ -102,6 +104,194 @@ class MissionControlPanel(QWidget):
         layout.addWidget(self.auto_button)
         
         return group
+    
+    def create_altitude_controls(self):
+        """Create altitude hold and loiter control panel (Phase 3.1)"""
+        group = QGroupBox("Altitude & Loiter Controls")
+        main_layout = QVBoxLayout(group)
+        
+        # Top row: Current status displays
+        status_layout = QHBoxLayout()
+        
+        # Current Altitude
+        self.current_alt_label = QLabel("Current Altitude: 0.0m")
+        self.current_alt_label.setStyleSheet("font-weight: bold; font-size: 12pt; padding: 5px;")
+        status_layout.addWidget(self.current_alt_label)
+        
+        # Current Position
+        self.current_pos_label = QLabel("Current Position: (0.000000, 0.000000)")
+        self.current_pos_label.setStyleSheet("font-weight: bold; font-size: 12pt; padding: 5px;")
+        status_layout.addWidget(self.current_pos_label)
+        
+        main_layout.addLayout(status_layout)
+        
+        # Middle row: Altitude adjustment buttons
+        adj_layout = QHBoxLayout()
+        
+        # Target altitude spinbox
+        adj_layout.addWidget(QLabel("Target Altitude (m):"))
+        self.target_alt_spin = QSpinBox()
+        self.target_alt_spin.setRange(0, 500)
+        self.target_alt_spin.setValue(150)
+        self.target_alt_spin.setStyleSheet("font-size: 11pt; padding: 5px;")
+        adj_layout.addWidget(self.target_alt_spin)
+        
+        # Quick adjustment buttons
+        adj_layout.addWidget(QLabel("  Quick Adjust:"))
+        
+        plus_10_btn = QPushButton("+10m")
+        plus_10_btn.clicked.connect(lambda: self.adjust_altitude(10))
+        plus_10_btn.setStyleSheet("background-color: #228B22; color: white; font-weight: bold;")
+        adj_layout.addWidget(plus_10_btn)
+        
+        plus_5_btn = QPushButton("+5m")
+        plus_5_btn.clicked.connect(lambda: self.adjust_altitude(5))
+        plus_5_btn.setStyleSheet("background-color: #32CD32; color: white; font-weight: bold;")
+        adj_layout.addWidget(plus_5_btn)
+        
+        plus_1_btn = QPushButton("+1m")
+        plus_1_btn.clicked.connect(lambda: self.adjust_altitude(1))
+        plus_1_btn.setStyleSheet("background-color: #90EE90; color: black; font-weight: bold;")
+        adj_layout.addWidget(plus_1_btn)
+        
+        minus_1_btn = QPushButton("-1m")
+        minus_1_btn.clicked.connect(lambda: self.adjust_altitude(-1))
+        minus_1_btn.setStyleSheet("background-color: #FFA07A; color: black; font-weight: bold;")
+        adj_layout.addWidget(minus_1_btn)
+        
+        minus_5_btn = QPushButton("-5m")
+        minus_5_btn.clicked.connect(lambda: self.adjust_altitude(-5))
+        minus_5_btn.setStyleSheet("background-color: #FF6347; color: white; font-weight: bold;")
+        adj_layout.addWidget(minus_5_btn)
+        
+        minus_10_btn = QPushButton("-10m")
+        minus_10_btn.clicked.connect(lambda: self.adjust_altitude(-10))
+        minus_10_btn.setStyleSheet("background-color: #DC143C; color: white; font-weight: bold;")
+        adj_layout.addWidget(minus_10_btn)
+        
+        main_layout.addLayout(adj_layout)
+        
+        # Bottom row: Mode and loiter controls
+        mode_layout = QHBoxLayout()
+        
+        # Mode buttons
+        qloiter_btn = QPushButton("QLOITER")
+        qloiter_btn.clicked.connect(lambda: self.send_mode_command("QLOITER"))
+        qloiter_btn.setStyleSheet("background-color: #4A90E2; color: white; font-weight: bold; padding: 8px;")
+        mode_layout.addWidget(qloiter_btn)
+        
+        guided_btn = QPushButton("GUIDED")
+        guided_btn.clicked.connect(lambda: self.send_mode_command("GUIDED"))
+        guided_btn.setStyleSheet("background-color: #7B68EE; color: white; font-weight: bold; padding: 8px;")
+        mode_layout.addWidget(guided_btn)
+        
+        # Hold altitude button
+        hold_alt_btn = QPushButton("HOLD CURRENT ALTITUDE")
+        hold_alt_btn.clicked.connect(self.hold_current_altitude)
+        hold_alt_btn.setStyleSheet("background-color: #FF8C00; color: white; font-weight: bold; padding: 8px;")
+        mode_layout.addWidget(hold_alt_btn)
+        
+        # Loiter here button
+        loiter_here_btn = QPushButton("LOITER HERE")
+        loiter_here_btn.clicked.connect(self.loiter_at_current_position)
+        loiter_here_btn.setStyleSheet("background-color: #9370DB; color: white; font-weight: bold; padding: 8px;")
+        mode_layout.addWidget(loiter_here_btn)
+        
+        # Loiter radius controls
+        mode_layout.addWidget(QLabel("  Loiter Radius (m):"))
+        self.loiter_radius_spin = QSpinBox()
+        self.loiter_radius_spin.setRange(10, 500)
+        self.loiter_radius_spin.setValue(50)
+        self.loiter_radius_spin.setStyleSheet("font-size: 11pt; padding: 5px;")
+        mode_layout.addWidget(self.loiter_radius_spin)
+        
+        set_radius_btn = QPushButton("SET RADIUS")
+        set_radius_btn.clicked.connect(self.set_loiter_radius)
+        set_radius_btn.setStyleSheet("background-color: #20B2AA; color: white; font-weight: bold; padding: 8px;")
+        mode_layout.addWidget(set_radius_btn)
+        
+        main_layout.addLayout(mode_layout)
+        
+        # Store current altitude for tracking
+        self.current_altitude = 0.0
+        
+        return group
+    
+    def adjust_altitude(self, delta):
+        """Adjust target altitude by delta and send command"""
+        current = self.target_alt_spin.value()
+        new_alt = current + delta
+        
+        # Safety checks
+        if new_alt < 0:
+            QMessageBox.warning(self, "Invalid Altitude", "Altitude cannot be negative.")
+            return
+        
+        if new_alt > 400:
+            reply = QMessageBox.question(self, 'High Altitude Warning', 
+                                         f'Target altitude {new_alt}m exceeds 400m. Continue?',
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+        
+        if new_alt < 100:
+            QMessageBox.information(self, 'Low Altitude Notice', 
+                                   f'Target altitude {new_alt}m is below 100m. Ensure sufficient clearance.')
+        
+        # Check for large changes
+        if abs(delta) > 50 or abs(new_alt - self.current_altitude) > 50:
+            reply = QMessageBox.question(self, 'Large Altitude Change', 
+                                         f'Change altitude by {abs(new_alt - self.current_altitude):.1f}m (current: {self.current_altitude:.1f}m → target: {new_alt}m)?',
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+        
+        self.target_alt_spin.setValue(new_alt)
+        self.send_altitude_command(new_alt)
+    
+    def send_altitude_command(self, altitude):
+        """Send altitude change command to autopilot"""
+        logger.info(f"Setting target altitude: {altitude}m (current: {self.current_altitude}m)")
+        self.command_requested.emit("CHANGE_ALTITUDE", {"altitude": altitude})
+    
+    def hold_current_altitude(self):
+        """Hold at current altitude"""
+        if self.current_altitude > 0:
+            logger.info(f"Holding current altitude: {self.current_altitude}m")
+            self.target_alt_spin.setValue(int(self.current_altitude))
+            self.send_altitude_command(self.current_altitude)
+        else:
+            QMessageBox.warning(self, "No Altitude Data", "Current altitude is 0m. Aircraft may not be airborne.")
+    
+    def loiter_at_current_position(self):
+        """Command aircraft to loiter at current position"""
+        if self.current_altitude < 50:
+            QMessageBox.warning(self, "Altitude Too Low", 
+                              "Cannot loiter below 50m altitude. Climb first.")
+            return
+        
+        logger.info(f"Commanding loiter at current position (alt: {self.current_altitude}m)")
+        self.command_requested.emit("LOITER_HERE", {})
+    
+    def set_loiter_radius(self):
+        """Set loiter circle radius"""
+        radius = self.loiter_radius_spin.value()
+        logger.info(f"Setting loiter radius: {radius}m")
+        self.command_requested.emit("SET_LOITER_RADIUS", {"radius": radius})
+    
+    def send_mode_command(self, mode):
+        """Send mode change command"""
+        logger.info(f"Requesting mode change to: {mode}")
+        self.command_requested.emit("SET_MODE", {"mode": mode})
+    
+    def update_altitude_display(self, altitude):
+        """Update current altitude display"""
+        self.current_altitude = altitude
+        self.current_alt_label.setText(f"Current Altitude: {altitude:.1f}m")
+    
+    def update_position_display(self, lat, lon):
+        """Update current position display"""
+        self.current_pos_label.setText(f"Current Position: ({lat:.6f}, {lon:.6f})")
     
     def create_map_widget(self):
         """Create interactive map for waypoint planning"""
@@ -196,288 +386,6 @@ class MissionControlPanel(QWidget):
         layout.addWidget(upload_btn)
         
         return group
-    
-    def _create_mission_progress_panel(self):
-        """
-        Create the mission progress monitoring panel.
-        Shows current waypoint, distance, ETA, and overall progress.
-        Phase 2.2 feature.
-        """
-        self.progress_group = QGroupBox("Mission Progress")
-        layout = QVBoxLayout()
-        
-        # Status line - which waypoint we're flying to
-        self.progress_status = QLabel("No mission active")
-        font = QFont("Arial", 11)
-        font.setBold(True)
-        self.progress_status.setFont(font)
-        self.progress_status.setStyleSheet("color: #333333;")
-        layout.addWidget(self.progress_status)
-        
-        # Add some spacing
-        layout.addSpacing(10)
-        
-        # Metrics row - distance and ETA side by side
-        metrics_layout = QHBoxLayout()
-        
-        self.distance_label = QLabel("Distance: --")
-        self.distance_label.setFont(QFont("Arial", 12))
-        self.distance_label.setStyleSheet("color: #0066CC;")
-        metrics_layout.addWidget(self.distance_label)
-        
-        metrics_layout.addStretch()
-        
-        self.eta_label = QLabel("ETA: --")
-        self.eta_label.setFont(QFont("Arial", 12))
-        self.eta_label.setStyleSheet("color: #009900;")
-        metrics_layout.addWidget(self.eta_label)
-        
-        layout.addLayout(metrics_layout)
-        
-        # Add spacing
-        layout.addSpacing(10)
-        
-        # Progress bar with label
-        progress_label = QLabel("Mission Progress")
-        layout.addWidget(progress_label)
-        
-        self.mission_progress_bar = QProgressBar()
-        self.mission_progress_bar.setMinimum(0)
-        self.mission_progress_bar.setMaximum(100)
-        self.mission_progress_bar.setValue(0)
-        self.mission_progress_bar.setTextVisible(True)
-        self.mission_progress_bar.setFormat("%p%")
-        self.mission_progress_bar.setFixedHeight(25)
-        
-        # Style the progress bar
-        self.mission_progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #BDBDBD;
-                border-radius: 3px;
-                background-color: #E0E0E0;
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                background-color: #4CAF50;
-            }
-        """)
-        
-        layout.addWidget(self.mission_progress_bar)
-        
-        # Add spacing
-        layout.addSpacing(10)
-        
-        # Next waypoint info
-        self.next_wp_label = QLabel("Upload a mission to begin")
-        font_italic = QFont("Arial", 10)
-        font_italic.setItalic(True)
-        self.next_wp_label.setFont(font_italic)
-        self.next_wp_label.setStyleSheet("color: #666666;")
-        layout.addWidget(self.next_wp_label)
-        
-        self.progress_group.setLayout(layout)
-        return self.progress_group
-    
-    def update_mission_progress(self, telemetry_data: dict):
-        """
-        Update mission progress display from telemetry.
-        Phase 2.2 feature.
-        
-        Args:
-            telemetry_data: Dictionary with keys:
-                - current_position: (lat, lon, alt) tuple
-                - current_seq: Current waypoint sequence
-                - ground_speed: Speed in m/s
-                - mode: Current flight mode
-        """
-        # ULTRA DEBUG
-        received_speed = telemetry_data.get('ground_speed')
-        print(f"!!! MISSION_CONTROL_PANEL: Received ground_speed = {received_speed} m/s !!!")
-        
-        # Check if mission exists
-        if not self.waypoints or len(self.waypoints) == 0:
-            self._clear_mission_progress()
-            return
-        
-        # Extract data
-        current_pos = telemetry_data.get('current_position')
-        current_seq = telemetry_data.get('current_seq')
-        ground_speed = telemetry_data.get('ground_speed')
-        mode = telemetry_data.get('mode', 'UNKNOWN')
-        
-        # Debug logging for ground speed
-        logger.info(f"Mission progress update - Speed: {ground_speed} m/s, Seq: {current_seq}, Mode: {mode}")
-        
-        # Handle None ground_speed explicitly
-        if ground_speed is None:
-            ground_speed = 0
-            logger.warning("Ground speed is None, defaulting to 0")
-        
-        # Validate data
-        if current_pos is None:
-            return
-        
-        # Default current_seq to 0 if not provided (hasn't started yet)
-        if current_seq is None:
-            if mode == 'AUTO':
-                current_seq = 0
-            else:
-                self._clear_mission_progress()
-                return
-        
-        current_lat, current_lon, current_alt = current_pos
-        total_waypoints = len(self.waypoints)
-        
-        # Update status based on mission state
-        if current_seq < total_waypoints:
-            self.progress_status.setText(f"Flying to Waypoint {current_seq + 1} of {total_waypoints}")
-            
-            # Get target waypoint
-            target_wp = self.waypoints[current_seq]
-            
-            # Calculate distance using haversine formula
-            distance_m = self._haversine(current_lat, current_lon, target_wp.lat, target_wp.lon)
-            
-            # Format distance display
-            if distance_m > 1000:
-                distance_str = f"{distance_m / 1000:.1f} km"
-            else:
-                distance_str = f"{int(distance_m)} m"
-            self.distance_label.setText(f"Distance: {distance_str}")
-            
-            # Calculate and format ETA
-            eta_seconds = self._calculate_eta(distance_m, ground_speed)
-            eta_str = self._format_eta(eta_seconds)
-            self.eta_label.setText(f"ETA: {eta_str}")
-            
-            # Update progress bar (waypoints completed / total)
-            progress_pct = (current_seq / total_waypoints) * 100
-            self.mission_progress_bar.setValue(int(progress_pct))
-            
-            # Update next waypoint info
-            self.next_wp_label.setText(
-                f"Next: WP{current_seq + 1} @ ({target_wp.lat:.4f}, {target_wp.lon:.4f}, {target_wp.alt:.0f}m)"
-            )
-        else:
-            # Mission complete
-            self.progress_status.setText(f"Mission Complete ({total_waypoints} waypoints)")
-            self.distance_label.setText("Distance: 0 m")
-            self.eta_label.setText("ETA: Complete")
-            self.mission_progress_bar.setValue(100)
-            self.next_wp_label.setText("All waypoints reached")
-    
-    def _clear_mission_progress(self):
-        """Reset progress display when no mission active. Phase 2.2."""
-        self.progress_status.setText("No mission active")
-        self.distance_label.setText("Distance: --")
-        self.eta_label.setText("ETA: --")
-        self.mission_progress_bar.setValue(0)
-        self.next_wp_label.setText("Upload a mission to begin")
-    
-    def _haversine(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        """
-        Calculate great circle distance between two points on Earth.
-        Phase 2.2 calculation.
-        
-        Args:
-            lat1, lon1: Current position (decimal degrees)
-            lat2, lon2: Target position (decimal degrees)
-            
-        Returns:
-            Distance in meters
-        """
-        R = 6371000  # Earth radius in meters
-        
-        # Convert to radians
-        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-        
-        # Haversine formula
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        
-        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-        c = 2 * asin(sqrt(a))
-        
-        return R * c
-    
-    def _calculate_eta(self, distance_m: float, ground_speed_ms: float) -> float:
-        """
-        Calculate estimated time to reach target.
-        Phase 2.2 calculation.
-        
-        Args:
-            distance_m: Distance to target in meters
-            ground_speed_ms: Current ground speed in m/s
-            
-        Returns:
-            ETA in seconds, or -1 if speed too low
-        """
-        MIN_SPEED = 1.0  # m/s - below this, ETA unreliable
-        
-        if ground_speed_ms < MIN_SPEED:
-            return -1  # Signal that ETA is not available
-        
-        eta_seconds = distance_m / ground_speed_ms
-        return eta_seconds
-    
-    def _format_eta(self, eta_seconds: float) -> str:
-        """
-        Format ETA for human-readable display.
-        Phase 2.2 helper.
-        
-        Args:
-            eta_seconds: Estimated time in seconds (or -1 if unavailable)
-            
-        Returns:
-            Formatted string like "45s", "2.5min", or "1.2hr"
-        """
-        if eta_seconds < 0:
-            return "--"
-        
-        if eta_seconds < 60:
-            # Less than 60 seconds - show as seconds
-            return f"{int(eta_seconds)}s"
-        elif eta_seconds < 3600:
-            # Less than 60 minutes - show as minutes
-            minutes = eta_seconds / 60
-            return f"{minutes:.1f}min"
-        else:
-            # 60+ minutes - show as hours
-            hours = eta_seconds / 3600
-            return f"{hours:.1f}hr"
-    
-    def set_mavlink_bridge(self, bridge):
-        """
-        Connect to MAVLink bridge for telemetry updates.
-        Phase 2.2 integration.
-        
-        Args:
-            bridge: MAVLinkBridge instance
-        """
-        self.mavlink_bridge = bridge
-        
-        # Connect telemetry signal to update method
-        if hasattr(bridge, 'telemetry_updated'):
-            bridge.telemetry_updated.connect(self._on_telemetry_updated)
-            logger.info("Mission progress connected to telemetry stream")
-    
-    def _on_telemetry_updated(self):
-        """
-        Process telemetry and update mission progress.
-        Phase 2.2 signal handler.
-        """
-        if not self.mavlink_bridge:
-            return
-        
-        # Gather required data from mavlink_bridge
-        telemetry_data = {
-            'current_position': getattr(self.mavlink_bridge, 'current_position', None),
-            'current_seq': getattr(self.mavlink_bridge, 'current_seq', None),
-            'ground_speed': getattr(self.mavlink_bridge, 'ground_speed', 0),
-            'mode': getattr(self.mavlink_bridge, 'mode', 'UNKNOWN')
-        }
-        
-        self.update_mission_progress(telemetry_data)
     
     def on_map_click(self, event):
         """Handle map click to add waypoint"""
