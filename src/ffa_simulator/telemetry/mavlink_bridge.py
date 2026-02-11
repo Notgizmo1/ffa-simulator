@@ -34,10 +34,47 @@ class TelemetryBridge:
         self.latitude = 0.0
         self.longitude = 0.0
         
+        # Mission tracking (Phase 3.2)
+        self.current_seq = 0          # Current waypoint sequence from MISSION_CURRENT
+        self.mission_waypoints = []   # Stored waypoint objects from upload
+        self.total_mission_wps = 0    # Total waypoints in uploaded mission
+        
         # Message counter for debug
         self._msg_count = 0
+        self._uploading = False  # Pause receive loop during mission upload
         
         logger.info("TelemetryBridge initialized")
+    
+    def set_mission_waypoints(self, waypoints):
+        """Store uploaded mission waypoints for progress tracking.
+        
+        Args:
+            waypoints: List of Waypoint objects with .lat, .lon, .alt attributes
+        """
+        self.mission_waypoints = list(waypoints)
+        self.total_mission_wps = len(waypoints)
+        self.current_seq = 0
+        logger.info(f"Mission waypoints stored: {self.total_mission_wps} waypoints")
+    
+    def get_mission_state(self):
+        """Get current mission progress state.
+        
+        Returns:
+            dict with current_seq, total_wps, waypoints list, and active flag
+        """
+        return {
+            'current_seq': self.current_seq,
+            'total_wps': self.total_mission_wps,
+            'waypoints': self.mission_waypoints,
+            'mission_active': self.total_mission_wps > 0 and self.current_mode == "AUTO"
+        }
+    
+    def clear_mission(self):
+        """Clear stored mission data."""
+        self.mission_waypoints = []
+        self.total_mission_wps = 0
+        self.current_seq = 0
+        logger.info("Mission data cleared")
     
     async def connect(self, connection_string):
         """Connect to MAVLink endpoint"""
@@ -95,7 +132,12 @@ class TelemetryBridge:
         
         try:
             while self.connected:
-                # Receive message (blocking call in executor)
+                # During mission upload, stop reading so upload thread gets protocol messages
+                if self._uploading:
+                    await asyncio.sleep(0.05)
+                    continue
+                
+                # Receive message (non-blocking)
                 msg = self.connection.recv_match(blocking=False)
                 
                 if msg:
@@ -110,7 +152,7 @@ class TelemetryBridge:
                         self.current_mode = self._get_mode_name(msg.custom_mode)
                         self.armed = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
                     
-                    elif msg.get_type() == 'MISSION_CURRENT':
+                    elif msg_type == 'MISSION_CURRENT':
                         self.current_seq = msg.seq
                         logger.debug(f"Current waypoint: {self.current_seq}")
 
@@ -245,7 +287,7 @@ class TelemetryBridge:
             elif command == "LAND":
                 return await self._set_mode("QLAND")
             elif command == "AUTO":
-                return await self._set_mode("AUTO")
+                return await self._start_mission()
             elif command == "CHANGE_ALTITUDE":
                 altitude = params.get("altitude", 100)
                 return await self._change_altitude(altitude)
@@ -356,6 +398,77 @@ class TelemetryBridge:
         logger.info(f"Takeoff command sent (target: {altitude}m)")
         return True
     
+    async def _start_mission(self):
+        """Start mission with smart takeoff sequence.
+        
+        If on the ground: ARM → GUIDED → TAKEOFF → wait for altitude → AUTO
+        If already in air: just switch to AUTO
+        """
+        # Check if already airborne (altitude > 3m)
+        if self.altitude > 3.0:
+            logger.info("Vehicle airborne, switching directly to AUTO")
+            return await self._set_mode("AUTO")
+        
+        logger.info("Starting mission from ground - using GUIDED takeoff sequence...")
+        
+        # Step 1: Make sure we're armed
+        if not self.armed:
+            logger.info("Vehicle not armed, force arming...")
+            await self._arm_force()
+            # Wait for ARM confirmation
+            for i in range(20):  # 2 second timeout
+                await asyncio.sleep(0.1)
+                if self.armed:
+                    logger.info("Vehicle armed confirmed")
+                    break
+            else:
+                logger.error("Failed to arm vehicle")
+                return False
+        
+        # Step 2: Switch to GUIDED mode for takeoff
+        logger.info("Setting GUIDED mode for takeoff...")
+        await self._set_mode("GUIDED")
+        await asyncio.sleep(0.5)
+        
+        # Step 3: Send takeoff command (use first WP altitude, or default 50m)
+        takeoff_alt = 50
+        if self.mission_waypoints:
+            takeoff_alt = self.mission_waypoints[0].alt
+        
+        logger.info(f"Sending GUIDED takeoff to {takeoff_alt}m...")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self.connection.mav.command_long_send,
+            self.connection.target_system,
+            self.connection.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0,  # confirmation
+            0, 0, 0, 0,  # params 1-4
+            0, 0,  # lat, lon (current position)
+            takeoff_alt  # altitude
+        )
+        
+        # Step 4: Wait for vehicle to reach minimum altitude before switching to AUTO
+        logger.info("Waiting for vehicle to reach altitude before starting AUTO...")
+        min_alt = min(10.0, takeoff_alt * 0.5)  # At least 10m or 50% of target
+        
+        for i in range(300):  # 30 second timeout
+            await asyncio.sleep(0.1)
+            if self.altitude >= min_alt:
+                logger.info(f"Altitude {self.altitude:.1f}m reached (threshold: {min_alt:.0f}m), switching to AUTO")
+                break
+            if not self.armed:
+                logger.error("Vehicle disarmed during takeoff!")
+                return False
+        else:
+            logger.warning(f"Altitude timeout ({self.altitude:.1f}m), switching to AUTO anyway")
+        
+        # Step 5: Switch to AUTO to start the mission
+        await self._set_mode("AUTO")
+        logger.info("Mission started in AUTO mode!")
+        return True
+    
     async def _change_altitude(self, altitude):
         """Change target altitude (for GUIDED or LOITER modes)"""
         logger.info(f"Changing altitude to {altitude}m...")
@@ -410,7 +523,15 @@ class TelemetryBridge:
         return True
     
     async def upload_mission(self, waypoints):
-        """Upload waypoint mission to autopilot"""
+        """Upload waypoint mission to autopilot using proper MAVLink protocol.
+        
+        MAVLink mission upload protocol:
+        1. Send MISSION_COUNT(n)
+        2. Autopilot sends MISSION_REQUEST(seq=0)
+        3. We send MISSION_ITEM(seq=0)
+        ... repeat for all items ...
+        N. Autopilot sends MISSION_ACK
+        """
         if not self.connected:
             logger.error("Cannot upload mission - not connected")
             return False
@@ -418,79 +539,171 @@ class TelemetryBridge:
         try:
             logger.info(f"Uploading mission with {len(waypoints)} waypoints...")
             
-            # Clear existing mission
+            # Store waypoints for mission progress tracking (Phase 3.2)
+            self.set_mission_waypoints(waypoints)
+            
+            # Pause the receive loop so it doesn't steal our protocol messages
+            self._uploading = True
+            await asyncio.sleep(0.15)  # Let receive loop notice the flag
+            
+            # Build mission items list
+            mission_items = self._build_mission_items(waypoints)
+            
+            # Run the blocking upload protocol in a thread
             loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self._upload_protocol, mission_items)
             
-            # Send mission count
-            await loop.run_in_executor(
-                None,
-                self.connection.waypoint_clear_all_send
-            )
+            self._uploading = False
+            return result
             
-            await asyncio.sleep(0.5)
-            
-            # Upload waypoints
-            mission_items = []
-            
-            # Item 0: Home position (required)
-            mission_items.append(mavutil.mavlink.MAVLink_mission_item_message(
+        except Exception as e:
+            logger.error(f"Mission upload failed: {e}", exc_info=True)
+            self._uploading = False
+            return False
+    
+    def _build_mission_items(self, waypoints):
+        """Build the list of MAVLink mission items."""
+        mission_items = []
+        
+        # Item 0: Home position (required by ArduPilot)
+        mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
+            self.connection.target_system,
+            self.connection.target_component,
+            0,  # seq
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+            0, 1,  # current, autocontinue
+            0, 0, 0, 0,  # params 1-4
+            int((self.latitude if self.latitude != 0 else -35.363262) * 1e7),
+            int((self.longitude if self.longitude != 0 else 149.165237) * 1e7),
+            0  # altitude (home is 0)
+        ))
+        
+        # Item 1: NAV_TAKEOFF (required for AUTO mode from ground)
+        takeoff_alt = waypoints[0].alt if waypoints else 50
+        mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
+            self.connection.target_system,
+            self.connection.target_component,
+            1,  # seq
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0, 1,  # current, autocontinue
+            0, 0, 0, 0,  # params 1-4
+            0, 0,  # lat, lon (ignored for takeoff)
+            takeoff_alt
+        ))
+        logger.info(f"Added NAV_TAKEOFF to {takeoff_alt}m as mission item 1")
+        
+        # Items 2+: User waypoints
+        for i, wp in enumerate(waypoints):
+            mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
                 self.connection.target_system,
                 self.connection.target_component,
-                0,  # seq
+                i + 2,  # seq (home=0, takeoff=1, user WPs=2+)
                 mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
                 mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                0,  # current (0 for all waypoints except first)
-                1,  # autocontinue
-                0, 0, 0, 0,  # params 1-4
-                self.latitude if self.latitude != 0 else 0,
-                self.longitude if self.longitude != 0 else 0,
-                0  # altitude (home is 0)
+                0, 1,  # current, autocontinue
+                wp.loiter_time,  # param1 (hold time)
+                wp.acceptance_radius,  # param2
+                0, 0,  # params 3-4
+                int(wp.lat * 1e7),
+                int(wp.lon * 1e7),
+                wp.alt
             ))
+        
+        return mission_items
+    
+    def _upload_protocol(self, mission_items):
+        """Execute the MAVLink mission upload handshake (blocking, runs in thread)."""
+        total_items = len(mission_items)
+        
+        try:
+            # Drain any pending messages
+            while self.connection.recv_match(blocking=False):
+                pass
             
-            # Add user waypoints
-            for i, wp in enumerate(waypoints):
-                mission_items.append(mavutil.mavlink.MAVLink_mission_item_message(
-                    self.connection.target_system,
-                    self.connection.target_component,
-                    i + 1,  # seq (starts at 1 after home)
-                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                    mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                    0,  # current
-                    1,  # autocontinue
-                    wp.loiter_time,  # param1 (hold time)
-                    wp.acceptance_radius,  # param2
-                    0, 0,  # params 3-4
-                    wp.lat,
-                    wp.lon,
-                    wp.alt
-                ))
+            logger.info(f"Sending MISSION_COUNT: {total_items} items")
             
-            # Send mission count
-            total_items = len(mission_items)
-            await loop.run_in_executor(
-                None,
-                self.connection.mav.mission_count_send,
+            # Step 1: Send MISSION_COUNT
+            self.connection.mav.mission_count_send(
                 self.connection.target_system,
                 self.connection.target_component,
                 total_items
             )
             
-            await asyncio.sleep(0.5)
+            # Step 2: Handle MISSION_REQUEST/ACK handshake
+            items_sent = 0
+            retries = 0
+            max_retries = 3
+            import time
+            start_time = time.time()
+            timeout_seconds = 15
             
-            # Send each mission item
-            for item in mission_items:
-                await loop.run_in_executor(
-                    None,
-                    self.connection.mav.send,
-                    item
+            while items_sent < total_items:
+                elapsed = time.time() - start_time
+                if elapsed > timeout_seconds:
+                    logger.error(f"Mission upload timed out after {elapsed:.1f}s (sent {items_sent}/{total_items})")
+                    return False
+                
+                msg = self.connection.recv_match(
+                    type=['MISSION_REQUEST', 'MISSION_REQUEST_INT', 'MISSION_ACK'],
+                    blocking=True,
+                    timeout=3
                 )
-                await asyncio.sleep(0.1)
+                
+                if msg is None:
+                    retries += 1
+                    if retries > max_retries:
+                        logger.error(f"No response from autopilot after {max_retries} retries")
+                        return False
+                    logger.warning(f"No MISSION_REQUEST received (retry {retries}/{max_retries}), resending MISSION_COUNT...")
+                    self.connection.mav.mission_count_send(
+                        self.connection.target_system,
+                        self.connection.target_component,
+                        total_items
+                    )
+                    continue
+                
+                msg_type = msg.get_type()
+                
+                if msg_type in ('MISSION_REQUEST', 'MISSION_REQUEST_INT'):
+                    seq = msg.seq
+                    if seq < total_items:
+                        self.connection.mav.send(mission_items[seq])
+                        items_sent = max(items_sent, seq + 1)
+                        logger.info(f"Sent mission item {seq}/{total_items - 1} (type: {mission_items[seq].command})")
+                        retries = 0  # Reset retries on success
+                    else:
+                        logger.warning(f"Requested seq {seq} out of range (total: {total_items})")
+                
+                elif msg_type == 'MISSION_ACK':
+                    if msg.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                        logger.info(f"MISSION_ACK: ACCEPTED — {total_items} items uploaded successfully")
+                        return True
+                    else:
+                        logger.error(f"MISSION_ACK: REJECTED (type={msg.type})")
+                        return False
             
-            logger.info(f"Mission uploaded successfully ({total_items} items)")
-            return True
+            # All items sent, wait for final ACK
+            logger.info(f"All {total_items} items sent, waiting for MISSION_ACK...")
+            msg = self.connection.recv_match(
+                type=['MISSION_ACK'],
+                blocking=True,
+                timeout=5
+            )
             
+            if msg and msg.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                logger.info(f"MISSION_ACK: ACCEPTED — upload complete")
+                return True
+            elif msg:
+                logger.error(f"MISSION_ACK: REJECTED (type={msg.type})")
+                return False
+            else:
+                logger.error("No MISSION_ACK received after sending all items")
+                return False
+                
         except Exception as e:
-            logger.error(f"Mission upload failed: {e}", exc_info=True)
+            logger.error(f"Upload protocol error: {e}", exc_info=True)
             return False
     
     async def disconnect(self):

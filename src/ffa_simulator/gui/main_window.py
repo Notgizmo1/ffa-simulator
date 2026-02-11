@@ -146,6 +146,7 @@ class MainWindow(QMainWindow):
         lat = telemetry['latitude']
         lon = telemetry['longitude']
         alt = telemetry['altitude']
+        groundspeed = telemetry['groundspeed']
         
         if lat != 0 and lon != 0:
             # Set home position on first valid GPS
@@ -159,6 +160,26 @@ class MainWindow(QMainWindow):
         # Update altitude and position displays (Phase 3.1)
         self.mission_control_panel.update_altitude_display(alt)
         self.mission_control_panel.update_position_display(lat, lon)
+        
+        # ── Phase 3.2: Mission Progress Tracking ──
+        mission_state = self.telemetry_bridge.get_mission_state()
+        current_seq = mission_state['current_seq']
+        total_wps = mission_state['total_wps']
+        waypoints = mission_state['waypoints']
+        mission_active = mission_state['mission_active']
+        
+        # Update mission progress widget (distance, ETA, bearing, progress bar)
+        self.mission_control_panel.update_mission_progress(
+            lat, lon, groundspeed,
+            current_seq, total_wps,
+            waypoints, mission_active
+        )
+        
+        # Update active waypoint marker on map
+        # ArduPilot seq: 0=home, 1=takeoff, 2+=user WPs → user_wp_index = current_seq - 2
+        if waypoints and current_seq >= 2:
+            user_wp_index = current_seq - 2
+            self.mission_control_panel.update_active_waypoint_marker(waypoints, user_wp_index)
     
     def upload_mission(self, waypoints):
         """Upload mission to autopilot"""

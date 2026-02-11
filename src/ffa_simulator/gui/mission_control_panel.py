@@ -3,9 +3,12 @@ import numpy as np
 from collections import deque
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                 QPushButton, QListWidget, QSpinBox, QDoubleSpinBox,
-                                QGroupBox, QGridLayout, QFileDialog, QMessageBox)
+                                QGroupBox, QGridLayout, QFileDialog, QMessageBox,
+                                QProgressBar)
 from PySide6.QtCore import Qt, Signal
 import pyqtgraph as pg
+
+from ffa_simulator.telemetry.mission_calculator import MissionCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,10 @@ class MissionControlPanel(QWidget):
         # Altitude Controls (Phase 3.1)
         altitude_controls = self.create_altitude_controls()
         layout.addWidget(altitude_controls)
+        
+        # Mission Progress (Phase 3.2)
+        mission_progress = self.create_mission_progress_widget()
+        layout.addWidget(mission_progress)
         
         # Middle: Map and waypoint list (side by side)
         middle_layout = QHBoxLayout()
@@ -217,6 +224,219 @@ class MissionControlPanel(QWidget):
         
         return group
     
+    def create_mission_progress_widget(self):
+        """Create mission progress tracking panel (Phase 3.2)"""
+        group = QGroupBox("Mission Progress")
+        main_layout = QHBoxLayout(group)
+        
+        # Left column: Waypoint info
+        left_layout = QGridLayout()
+        
+        # Current waypoint label
+        left_layout.addWidget(QLabel("Current WP:"), 0, 0)
+        self.progress_current_wp = QLabel("--- / ---")
+        self.progress_current_wp.setStyleSheet("font-weight: bold; font-size: 12pt; color: #2196F3;")
+        left_layout.addWidget(self.progress_current_wp, 0, 1)
+        
+        # Distance to next waypoint
+        left_layout.addWidget(QLabel("Dist to WP:"), 1, 0)
+        self.progress_dist_to_wp = QLabel("---")
+        self.progress_dist_to_wp.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        left_layout.addWidget(self.progress_dist_to_wp, 1, 1)
+        
+        # Bearing to next waypoint
+        left_layout.addWidget(QLabel("Bearing:"), 2, 0)
+        self.progress_bearing = QLabel("---")
+        self.progress_bearing.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        left_layout.addWidget(self.progress_bearing, 2, 1)
+        
+        main_layout.addLayout(left_layout)
+        
+        # Center column: ETA info
+        center_layout = QGridLayout()
+        
+        # ETA to next waypoint
+        center_layout.addWidget(QLabel("ETA to WP:"), 0, 0)
+        self.progress_eta_wp = QLabel("---")
+        self.progress_eta_wp.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        center_layout.addWidget(self.progress_eta_wp, 0, 1)
+        
+        # Total remaining distance
+        center_layout.addWidget(QLabel("Remaining:"), 1, 0)
+        self.progress_remaining_dist = QLabel("---")
+        self.progress_remaining_dist.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        center_layout.addWidget(self.progress_remaining_dist, 1, 1)
+        
+        # Total ETA
+        center_layout.addWidget(QLabel("Total ETA:"), 2, 0)
+        self.progress_total_eta = QLabel("---")
+        self.progress_total_eta.setStyleSheet("font-weight: bold; font-size: 11pt; color: #FF8C00;")
+        center_layout.addWidget(self.progress_total_eta, 2, 1)
+        
+        main_layout.addLayout(center_layout)
+        
+        # Right column: Progress bar and status
+        right_layout = QVBoxLayout()
+        
+        # Mission status label
+        self.progress_status = QLabel("NO MISSION")
+        self.progress_status.setStyleSheet(
+            "font-weight: bold; font-size: 11pt; padding: 4px; "
+            "background-color: #555; color: white; border-radius: 3px;"
+        )
+        self.progress_status.setAlignment(Qt.AlignCenter)
+        right_layout.addWidget(self.progress_status)
+        
+        # Progress bar
+        self.mission_progress_bar = QProgressBar()
+        self.mission_progress_bar.setRange(0, 100)
+        self.mission_progress_bar.setValue(0)
+        self.mission_progress_bar.setTextVisible(True)
+        self.mission_progress_bar.setFormat("%v%")
+        self.mission_progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #555;
+                border-radius: 5px;
+                text-align: center;
+                font-weight: bold;
+                font-size: 11pt;
+                min-height: 24px;
+            }
+            QProgressBar::chunk {
+                background-color: #2196F3;
+                border-radius: 3px;
+            }
+        """)
+        right_layout.addWidget(self.mission_progress_bar)
+        
+        # Groundspeed display
+        self.progress_groundspeed = QLabel("GS: --- m/s")
+        self.progress_groundspeed.setStyleSheet("font-weight: bold; font-size: 10pt; color: #888;")
+        self.progress_groundspeed.setAlignment(Qt.AlignCenter)
+        right_layout.addWidget(self.progress_groundspeed)
+        
+        main_layout.addLayout(right_layout)
+        
+        return group
+    
+    def update_mission_progress(self, lat, lon, groundspeed, current_seq, total_wps, waypoints, mission_active):
+        """Update mission progress display with current telemetry.
+        
+        Args:
+            lat: Current latitude (decimal degrees)
+            lon: Current longitude (decimal degrees)  
+            groundspeed: Current groundspeed (m/s)
+            current_seq: Current waypoint sequence number from MISSION_CURRENT
+            total_wps: Total number of user waypoints in mission
+            waypoints: List of Waypoint objects
+            mission_active: True if mode is AUTO and mission is loaded
+        """
+        # Update groundspeed display always
+        self.progress_groundspeed.setText(f"GS: {groundspeed:.1f} m/s")
+        
+        # No mission loaded
+        if total_wps == 0 or not waypoints:
+            self.progress_status.setText("NO MISSION")
+            self.progress_status.setStyleSheet(
+                "font-weight: bold; font-size: 11pt; padding: 4px; "
+                "background-color: #555; color: white; border-radius: 3px;"
+            )
+            self.progress_current_wp.setText("--- / ---")
+            self.progress_dist_to_wp.setText("---")
+            self.progress_bearing.setText("---")
+            self.progress_eta_wp.setText("---")
+            self.progress_remaining_dist.setText("---")
+            self.progress_total_eta.setText("---")
+            self.mission_progress_bar.setValue(0)
+            return
+        
+        # current_seq from ArduPilot: seq 0 = home, seq 1 = NAV_TAKEOFF, seq 2+ = user WPs
+        # Our waypoints list is 0-indexed, so user_wp_index = current_seq - 2
+        user_wp_index = current_seq - 2
+        
+        # Clamp to valid range
+        if user_wp_index < 0:
+            user_wp_index = 0
+        if user_wp_index >= total_wps:
+            # Mission complete - past last waypoint
+            self.progress_status.setText("MISSION COMPLETE")
+            self.progress_status.setStyleSheet(
+                "font-weight: bold; font-size: 11pt; padding: 4px; "
+                "background-color: #51cf66; color: white; border-radius: 3px;"
+            )
+            self.progress_current_wp.setText(f"{total_wps} / {total_wps}")
+            self.progress_dist_to_wp.setText("0m")
+            self.progress_bearing.setText("---")
+            self.progress_eta_wp.setText("00:00:00")
+            self.progress_remaining_dist.setText("0m")
+            self.progress_total_eta.setText("00:00:00")
+            self.mission_progress_bar.setValue(100)
+            return
+        
+        # Update status
+        if mission_active:
+            self.progress_status.setText("AUTO - IN PROGRESS")
+            self.progress_status.setStyleSheet(
+                "font-weight: bold; font-size: 11pt; padding: 4px; "
+                "background-color: #2196F3; color: white; border-radius: 3px;"
+            )
+        else:
+            self.progress_status.setText("MISSION LOADED")
+            self.progress_status.setStyleSheet(
+                "font-weight: bold; font-size: 11pt; padding: 4px; "
+                "background-color: #FF8C00; color: white; border-radius: 3px;"
+            )
+        
+        # Current waypoint display (1-indexed for user)
+        self.progress_current_wp.setText(f"{user_wp_index + 1} / {total_wps}")
+        
+        # Distance to next waypoint
+        if lat != 0 and lon != 0:
+            target_wp = waypoints[user_wp_index]
+            dist_to_wp = MissionCalculator.haversine_distance(
+                lat, lon, target_wp.lat, target_wp.lon
+            )
+            self.progress_dist_to_wp.setText(MissionCalculator.format_distance(dist_to_wp))
+            
+            # Bearing to next waypoint
+            bearing = MissionCalculator.calculate_bearing(
+                lat, lon, target_wp.lat, target_wp.lon
+            )
+            cardinal = MissionCalculator.bearing_to_cardinal(bearing)
+            self.progress_bearing.setText(f"{bearing:.0f}° ({cardinal})")
+            
+            # ETA to next waypoint
+            eta_wp = MissionCalculator.calculate_eta(dist_to_wp, groundspeed)
+            self.progress_eta_wp.setText(MissionCalculator.format_time(eta_wp))
+            
+            # Total remaining distance
+            remaining = MissionCalculator.calculate_remaining_distance(
+                lat, lon, user_wp_index, waypoints
+            )
+            self.progress_remaining_dist.setText(MissionCalculator.format_distance(remaining))
+            
+            # Total remaining ETA
+            total_eta = MissionCalculator.calculate_eta(remaining, groundspeed)
+            self.progress_total_eta.setText(MissionCalculator.format_time(total_eta))
+            
+            # Progress bar: percentage of waypoints completed
+            # Factor in distance to current WP for smoother progress
+            total_dist = MissionCalculator.calculate_total_mission_distance(waypoints)
+            if total_dist > 0:
+                completed_dist = total_dist - remaining
+                progress_pct = max(0, min(100, int((completed_dist / total_dist) * 100)))
+            else:
+                # Fallback to waypoint-count-based progress
+                progress_pct = int((user_wp_index / total_wps) * 100)
+            
+            self.mission_progress_bar.setValue(progress_pct)
+        else:
+            self.progress_dist_to_wp.setText("No GPS")
+            self.progress_bearing.setText("---")
+            self.progress_eta_wp.setText("---")
+            self.progress_remaining_dist.setText("---")
+            self.progress_total_eta.setText("---")
+    
     def adjust_altitude(self, delta):
         """Adjust target altitude by delta and send command"""
         current = self.target_alt_spin.value()
@@ -319,6 +539,13 @@ class MissionControlPanel(QWidget):
         # Current position marker
         self.current_pos_marker = pg.ScatterPlotItem(size=12, brush=pg.mkBrush('y'), symbol='t')
         self.map_plot.addItem(self.current_pos_marker)
+        
+        # Active waypoint marker (Phase 3.2 - highlights target WP)
+        self.active_wp_marker = pg.ScatterPlotItem(
+            size=18, brush=pg.mkBrush(0, 255, 0, 120), 
+            pen=pg.mkPen(color='lime', width=2), symbol='o'
+        )
+        self.map_plot.addItem(self.active_wp_marker)
         
         # Click handler
         self.map_plot.scene().sigMouseClicked.connect(self.on_map_click)
@@ -432,6 +659,14 @@ class MissionControlPanel(QWidget):
             self.waypoint_markers.setData([], [])
             self.path_line.setData([], [])
     
+    def update_active_waypoint_marker(self, waypoints, user_wp_index):
+        """Highlight the current target waypoint on the map (Phase 3.2)."""
+        if waypoints and 0 <= user_wp_index < len(waypoints):
+            target = waypoints[user_wp_index]
+            self.active_wp_marker.setData([target.lon], [target.lat])
+        else:
+            self.active_wp_marker.setData([], [])
+    
     def delete_waypoint(self):
         """Delete selected waypoint"""
         current_row = self.waypoint_list.currentRow()
@@ -448,6 +683,7 @@ class MissionControlPanel(QWidget):
         if reply == QMessageBox.Yes:
             self.waypoints.clear()
             self.update_waypoint_display()
+            self.active_wp_marker.setData([], [])
             logger.info("Mission cleared")
     
     def set_home_position(self, lat, lon):
