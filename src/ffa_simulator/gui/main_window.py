@@ -179,12 +179,13 @@ class MainWindow(QMainWindow):
         total_wps = mission_state['total_wps']
         waypoints = mission_state['waypoints']
         mission_active = mission_state['mission_active']
+        mission_complete = mission_state.get('mission_complete', False)
         
         # Update mission progress widget (distance, ETA, bearing, progress bar)
         self.mission_control_panel.update_mission_progress(
             lat, lon, groundspeed,
             current_seq, total_wps,
-            waypoints, mission_active
+            waypoints, mission_active, mission_complete
         )
         
         # Update active waypoint marker on map
@@ -192,6 +193,15 @@ class MainWindow(QMainWindow):
         if waypoints and current_seq >= 2:
             user_wp_index = current_seq - 2
             self.mission_control_panel.update_active_waypoint_marker(waypoints, user_wp_index)
+        
+        # ── Mission Complete Detection ──
+        if mission_complete and telemetry['armed']:
+            if not hasattr(self, '_mission_complete_handled') or not self._mission_complete_handled:
+                self._mission_complete_handled = True
+                logger.info("MISSION COMPLETE — All waypoints reached. Commanding RTL.")
+                self.send_command("RTL", {})
+        elif not mission_complete:
+            self._mission_complete_handled = False
         
         # ── Telemetry Recording (for CSV export) ──
         if self.recording_start_time is None:

@@ -327,18 +327,8 @@ class MissionControlPanel(QWidget):
         
         return group
     
-    def update_mission_progress(self, lat, lon, groundspeed, current_seq, total_wps, waypoints, mission_active):
-        """Update mission progress display with current telemetry.
-        
-        Args:
-            lat: Current latitude (decimal degrees)
-            lon: Current longitude (decimal degrees)  
-            groundspeed: Current groundspeed (m/s)
-            current_seq: Current waypoint sequence number from MISSION_CURRENT
-            total_wps: Total number of user waypoints in mission
-            waypoints: List of Waypoint objects
-            mission_active: True if mode is AUTO and mission is loaded
-        """
+    def update_mission_progress(self, lat, lon, groundspeed, current_seq, total_wps, waypoints, mission_active, mission_complete=False):
+        """Update mission progress display with current telemetry."""
         # Update groundspeed display always
         self.progress_groundspeed.setText(f"GS: {groundspeed:.1f} m/s")
         
@@ -358,16 +348,12 @@ class MissionControlPanel(QWidget):
             self.mission_progress_bar.setValue(0)
             return
         
+        # Mission complete — either from MISSION_ITEM_REACHED or seq past last WP
         # current_seq from ArduPilot: seq 0 = home, seq 1 = NAV_TAKEOFF, seq 2+ = user WPs
-        # Our waypoints list is 0-indexed, so user_wp_index = current_seq - 2
         user_wp_index = current_seq - 2
         
-        # Clamp to valid range
-        if user_wp_index < 0:
-            user_wp_index = 0
-        if user_wp_index >= total_wps:
-            # Mission complete - past last waypoint
-            self.progress_status.setText("MISSION COMPLETE")
+        if mission_complete or user_wp_index >= total_wps:
+            self.progress_status.setText("MISSION COMPLETE — RTL")
             self.progress_status.setStyleSheet(
                 "font-weight: bold; font-size: 11pt; padding: 4px; "
                 "background-color: #51cf66; color: white; border-radius: 3px;"
@@ -375,11 +361,15 @@ class MissionControlPanel(QWidget):
             self.progress_current_wp.setText(f"{total_wps} / {total_wps}")
             self.progress_dist_to_wp.setText("0m")
             self.progress_bearing.setText("---")
-            self.progress_eta_wp.setText("00:00:00")
+            self.progress_eta_wp.setText("Done")
             self.progress_remaining_dist.setText("0m")
-            self.progress_total_eta.setText("00:00:00")
+            self.progress_total_eta.setText("Done")
             self.mission_progress_bar.setValue(100)
             return
+        
+        # Clamp to valid range
+        if user_wp_index < 0:
+            user_wp_index = 0
         
         # Update status
         if mission_active:

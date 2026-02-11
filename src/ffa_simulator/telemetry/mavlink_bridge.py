@@ -39,6 +39,8 @@ class TelemetryBridge:
         self.current_seq = 0          # Current waypoint sequence from MISSION_CURRENT
         self.mission_waypoints = []   # Stored waypoint objects from upload
         self.total_mission_wps = 0    # Total waypoints in uploaded mission
+        self.last_wp_reached_seq = -1 # Last MISSION_ITEM_REACHED seq
+        self.mission_complete = False  # Set when final waypoint reached
         
         # Message counter for debug
         self._msg_count = 0
@@ -47,27 +49,25 @@ class TelemetryBridge:
         logger.info("TelemetryBridge initialized")
     
     def set_mission_waypoints(self, waypoints):
-        """Store uploaded mission waypoints for progress tracking.
-        
-        Args:
-            waypoints: List of Waypoint objects with .lat, .lon, .alt attributes
-        """
+        """Store uploaded mission waypoints for progress tracking."""
         self.mission_waypoints = list(waypoints)
         self.total_mission_wps = len(waypoints)
         self.current_seq = 0
+        self.mission_complete = False
+        self.last_wp_reached_seq = -1
         logger.info(f"Mission waypoints stored: {self.total_mission_wps} waypoints")
     
     def get_mission_state(self):
-        """Get current mission progress state.
-        
-        Returns:
-            dict with current_seq, total_wps, waypoints list, and active flag
-        """
+        """Get current mission progress state."""
+        # Mission is active if waypoints loaded and vehicle is in AUTO or was recently in AUTO
+        is_auto = self.current_mode == "AUTO"
+        has_mission = self.total_mission_wps > 0
         return {
             'current_seq': self.current_seq,
             'total_wps': self.total_mission_wps,
             'waypoints': self.mission_waypoints,
-            'mission_active': self.total_mission_wps > 0 and self.current_mode == "AUTO"
+            'mission_active': has_mission and (is_auto or self.current_seq > 0),
+            'mission_complete': self.mission_complete,
         }
     
     def clear_mission(self):
@@ -75,6 +75,8 @@ class TelemetryBridge:
         self.mission_waypoints = []
         self.total_mission_wps = 0
         self.current_seq = 0
+        self.mission_complete = False
+        self.last_wp_reached_seq = -1
         logger.info("Mission data cleared")
     
     async def connect(self, connection_string):
@@ -156,6 +158,16 @@ class TelemetryBridge:
                     elif msg_type == 'MISSION_CURRENT':
                         self.current_seq = msg.seq
                         logger.debug(f"Current waypoint: {self.current_seq}")
+                    
+                    elif msg_type == 'MISSION_ITEM_REACHED':
+                        self.last_wp_reached_seq = msg.seq
+                        logger.info(f"Waypoint reached: seq {msg.seq}")
+                        # Check if this is the last user waypoint
+                        # Mission structure: HOME(0), TAKEOFF(1), UserWP1(2)...UserWPN(N+1)
+                        last_seq = self.total_mission_wps + 1  # +1 for HOME, TAKEOFF offset
+                        if msg.seq >= last_seq and self.total_mission_wps > 0:
+                            self.mission_complete = True
+                            logger.info(f"MISSION COMPLETE: Final waypoint (seq {msg.seq}) reached")
 
                     elif msg_type == 'SYS_STATUS':
                         self.battery_voltage = msg.voltage_battery / 1000.0
