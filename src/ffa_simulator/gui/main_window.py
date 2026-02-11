@@ -34,6 +34,8 @@ class MainWindow(QMainWindow):
         self.telemetry_bridge = TelemetryBridge()
         self.telemetry_log = []  # List of dicts for CSV export
         self.recording_start_time = None
+        self._geofence_warned = False
+        self._geofence_rtl_sent = False
         self.init_ui()
         self.setup_logging()
         self.setup_telemetry_timer()
@@ -202,6 +204,23 @@ class MainWindow(QMainWindow):
                 self.send_command("RTL", {})
         elif not mission_complete:
             self._mission_complete_handled = False
+        
+        # ── Geofence Check ──
+        if self.mission_control_panel.geofence_enabled and telemetry['armed'] and lat != 0:
+            geofence_status = self.mission_control_panel.check_geofence(lat, lon)
+            self.mission_control_panel.update_geofence_status(geofence_status)
+            
+            if geofence_status['status'] == 'warning' and not self._geofence_warned:
+                self._geofence_warned = True
+                logger.warning(f"GEOFENCE WARNING: Approaching boundary ({geofence_status['distance_pct']:.0f}%)")
+            elif geofence_status['status'] == 'breach':
+                if not self._geofence_rtl_sent:
+                    self._geofence_rtl_sent = True
+                    logger.warning(f"GEOFENCE BREACH: Vehicle outside boundary! Commanding RTL.")
+                    self.send_command("RTL", {})
+            elif geofence_status['status'] == 'safe':
+                self._geofence_warned = False
+                self._geofence_rtl_sent = False
         
         # ── Telemetry Recording (for CSV export) ──
         if self.recording_start_time is None:

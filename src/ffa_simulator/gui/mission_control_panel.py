@@ -5,8 +5,9 @@ from collections import deque
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                 QPushButton, QListWidget, QSpinBox, QDoubleSpinBox,
                                 QGroupBox, QGridLayout, QFileDialog, QMessageBox,
-                                QProgressBar)
+                                QProgressBar, QComboBox, QCheckBox)
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 import pyqtgraph as pg
 
 from ffa_simulator.telemetry.mission_calculator import MissionCalculator
@@ -41,6 +42,15 @@ class MissionControlPanel(QWidget):
         self.home_position = None  # (lat, lon)
         self.flight_start_time = None  # Timestamp when mission started
         
+        # Geofence state
+        self.geofence_enabled = False
+        self.geofence_type = 'circle'  # 'circle' or 'polygon'
+        self.geofence_radius = 500     # meters (circle mode)
+        self.geofence_polygon_points = []  # [(lat, lon), ...] for polygon mode
+        self.geofence_breach = False
+        self.geofence_warning = False   # True when within warning zone (80-100%)
+        self._adding_polygon_vertices = False  # Shift+click mode
+        
         self.init_ui()
         
     def init_ui(self):
@@ -58,6 +68,10 @@ class MissionControlPanel(QWidget):
         # Mission Progress (Phase 3.2)
         mission_progress = self.create_mission_progress_widget()
         layout.addWidget(mission_progress)
+        
+        # Geofence Controls
+        geofence_controls = self.create_geofence_controls()
+        layout.addWidget(geofence_controls)
         
         # Middle: Map and waypoint list (side by side)
         middle_layout = QHBoxLayout()
@@ -525,6 +539,341 @@ class MissionControlPanel(QWidget):
         """Update current position display"""
         self.current_pos_label.setText(f"Current Position: ({lat:.6f}, {lon:.6f})")
     
+    def create_geofence_controls(self):
+        """Create geofence configuration controls"""
+        group = QGroupBox("Geofence")
+        main_layout = QHBoxLayout(group)
+        
+        # Enable checkbox
+        self.geofence_enable_cb = QCheckBox("Enable")
+        self.geofence_enable_cb.setStyleSheet("font-weight: bold;")
+        self.geofence_enable_cb.toggled.connect(self._toggle_geofence)
+        main_layout.addWidget(self.geofence_enable_cb)
+        
+        # Type selector
+        main_layout.addWidget(QLabel("Type:"))
+        self.geofence_type_combo = QComboBox()
+        self.geofence_type_combo.addItems(["Circle", "Polygon"])
+        self.geofence_type_combo.currentTextChanged.connect(self._geofence_type_changed)
+        main_layout.addWidget(self.geofence_type_combo)
+        
+        # Radius spinner (circle mode)
+        main_layout.addWidget(QLabel("Radius (m):"))
+        self.geofence_radius_spin = QSpinBox()
+        self.geofence_radius_spin.setRange(50, 5000)
+        self.geofence_radius_spin.setValue(500)
+        self.geofence_radius_spin.setSingleStep(50)
+        self.geofence_radius_spin.valueChanged.connect(self._update_geofence_radius)
+        main_layout.addWidget(self.geofence_radius_spin)
+        
+        # Polygon vertex controls
+        self.geofence_add_vertex_btn = QPushButton("Add Vertices (Shift+Click)")
+        self.geofence_add_vertex_btn.setStyleSheet(
+            "background-color: #FF9800; color: white; font-weight: bold; padding: 5px;"
+        )
+        self.geofence_add_vertex_btn.setCheckable(True)
+        self.geofence_add_vertex_btn.toggled.connect(self._toggle_polygon_mode)
+        self.geofence_add_vertex_btn.setVisible(False)  # Hidden in circle mode
+        main_layout.addWidget(self.geofence_add_vertex_btn)
+        
+        self.geofence_clear_poly_btn = QPushButton("Clear Vertices")
+        self.geofence_clear_poly_btn.clicked.connect(self._clear_polygon_vertices)
+        self.geofence_clear_poly_btn.setVisible(False)
+        main_layout.addWidget(self.geofence_clear_poly_btn)
+        
+        # Vertex count label
+        self.geofence_vertex_count = QLabel("")
+        self.geofence_vertex_count.setVisible(False)
+        main_layout.addWidget(self.geofence_vertex_count)
+        
+        # Status indicator
+        self.geofence_status_label = QLabel("OFF")
+        self.geofence_status_label.setStyleSheet(
+            "font-weight: bold; padding: 4px 8px; background-color: #555; "
+            "color: white; border-radius: 3px;"
+        )
+        main_layout.addWidget(self.geofence_status_label)
+        
+        main_layout.addStretch()
+        
+        return group
+    
+    def _toggle_geofence(self, enabled):
+        """Enable/disable geofence"""
+        self.geofence_enabled = enabled
+        if enabled:
+            if self.geofence_type == 'circle' and self.home_position:
+                self._draw_circle_geofence()
+                self.geofence_status_label.setText("ACTIVE")
+                self.geofence_status_label.setStyleSheet(
+                    "font-weight: bold; padding: 4px 8px; background-color: #51cf66; "
+                    "color: white; border-radius: 3px;"
+                )
+                logger.info(f"Geofence enabled: Circle, radius={self.geofence_radius}m")
+            elif self.geofence_type == 'polygon' and len(self.geofence_polygon_points) >= 3:
+                self._draw_polygon_geofence()
+                self.geofence_status_label.setText("ACTIVE")
+                self.geofence_status_label.setStyleSheet(
+                    "font-weight: bold; padding: 4px 8px; background-color: #51cf66; "
+                    "color: white; border-radius: 3px;"
+                )
+                logger.info(f"Geofence enabled: Polygon, {len(self.geofence_polygon_points)} vertices")
+            elif self.geofence_type == 'polygon':
+                self.geofence_status_label.setText("NEED 3+ VERTICES")
+                self.geofence_status_label.setStyleSheet(
+                    "font-weight: bold; padding: 4px 8px; background-color: #FF8C00; "
+                    "color: white; border-radius: 3px;"
+                )
+            elif not self.home_position:
+                self.geofence_status_label.setText("NEED HOME POS")
+                self.geofence_status_label.setStyleSheet(
+                    "font-weight: bold; padding: 4px 8px; background-color: #FF8C00; "
+                    "color: white; border-radius: 3px;"
+                )
+        else:
+            self._clear_geofence_drawing()
+            self.geofence_status_label.setText("OFF")
+            self.geofence_status_label.setStyleSheet(
+                "font-weight: bold; padding: 4px 8px; background-color: #555; "
+                "color: white; border-radius: 3px;"
+            )
+            self.geofence_breach = False
+            self.geofence_warning = False
+            logger.info("Geofence disabled")
+    
+    def _geofence_type_changed(self, text):
+        """Switch between circle and polygon mode"""
+        self.geofence_type = 'circle' if text == "Circle" else 'polygon'
+        is_poly = self.geofence_type == 'polygon'
+        
+        # Show/hide relevant controls
+        self.geofence_radius_spin.setVisible(not is_poly)
+        self.geofence_add_vertex_btn.setVisible(is_poly)
+        self.geofence_clear_poly_btn.setVisible(is_poly)
+        self.geofence_vertex_count.setVisible(is_poly)
+        
+        # Find and toggle the radius label visibility
+        for i in range(self.geofence_radius_spin.parent().layout().count()):
+            item = self.geofence_radius_spin.parent().layout().itemAt(i)
+            if item and item.widget() and isinstance(item.widget(), QLabel):
+                if item.widget().text() == "Radius (m):":
+                    item.widget().setVisible(not is_poly)
+        
+        # Redraw if enabled
+        if self.geofence_enabled:
+            self._clear_geofence_drawing()
+            self._toggle_geofence(True)
+    
+    def _update_geofence_radius(self, value):
+        """Update circle geofence radius"""
+        self.geofence_radius = value
+        if self.geofence_enabled and self.geofence_type == 'circle':
+            self._draw_circle_geofence()
+    
+    def _toggle_polygon_mode(self, active):
+        """Toggle Shift+Click mode for adding polygon vertices"""
+        self._adding_polygon_vertices = active
+        if active:
+            self.geofence_add_vertex_btn.setStyleSheet(
+                "background-color: #e53935; color: white; font-weight: bold; padding: 5px;"
+            )
+            self.geofence_add_vertex_btn.setText("ADDING... (Click Map)")
+        else:
+            self.geofence_add_vertex_btn.setStyleSheet(
+                "background-color: #FF9800; color: white; font-weight: bold; padding: 5px;"
+            )
+            self.geofence_add_vertex_btn.setText("Add Vertices (Shift+Click)")
+    
+    def _clear_polygon_vertices(self):
+        """Clear all polygon geofence vertices"""
+        self.geofence_polygon_points = []
+        self._clear_geofence_drawing()
+        self.geofence_vertex_count.setText("")
+        if self.geofence_enabled:
+            self.geofence_status_label.setText("NEED 3+ VERTICES")
+            self.geofence_status_label.setStyleSheet(
+                "font-weight: bold; padding: 4px 8px; background-color: #FF8C00; "
+                "color: white; border-radius: 3px;"
+            )
+        logger.info("Polygon vertices cleared")
+    
+    def _draw_circle_geofence(self):
+        """Draw circular geofence boundary on map"""
+        if not self.home_position:
+            return
+        
+        center_lat, center_lon = self.home_position
+        
+        # Convert radius from meters to approximate degrees
+        # 1 degree lat ≈ 111,320m, 1 degree lon ≈ 111,320m * cos(lat)
+        lat_offset = self.geofence_radius / 111320.0
+        lon_offset = self.geofence_radius / (111320.0 * np.cos(np.radians(center_lat)))
+        
+        # Generate circle points (breach boundary)
+        angles = np.linspace(0, 2 * np.pi, 72)  # 72 points for smooth circle
+        breach_lons = center_lon + lon_offset * np.cos(angles)
+        breach_lats = center_lat + lat_offset * np.sin(angles)
+        
+        # Warning boundary at 80% radius
+        warn_lat_offset = lat_offset * 0.8
+        warn_lon_offset = lon_offset * 0.8
+        warn_lons = center_lon + warn_lon_offset * np.cos(angles)
+        warn_lats = center_lat + warn_lat_offset * np.sin(angles)
+        
+        # Draw breach boundary (red dashed)
+        self.geofence_breach_line.setData(breach_lons, breach_lats)
+        # Draw warning boundary (yellow dashed)
+        self.geofence_warning_line.setData(warn_lons, warn_lats)
+        # Clear polygon markers
+        self.geofence_vertex_markers.setData([], [])
+    
+    def _draw_polygon_geofence(self):
+        """Draw polygon geofence boundary on map"""
+        if len(self.geofence_polygon_points) < 3:
+            return
+        
+        lats = [p[0] for p in self.geofence_polygon_points]
+        lons = [p[1] for p in self.geofence_polygon_points]
+        
+        # Close the polygon
+        lats_closed = lats + [lats[0]]
+        lons_closed = lons + [lons[0]]
+        
+        # Draw breach boundary (red)
+        self.geofence_breach_line.setData(lons_closed, lats_closed)
+        
+        # Warning boundary — shrink polygon by 20% toward centroid
+        centroid_lat = np.mean(lats)
+        centroid_lon = np.mean(lons)
+        warn_lats = [centroid_lat + 0.8 * (lat - centroid_lat) for lat in lats]
+        warn_lons = [centroid_lon + 0.8 * (lon - centroid_lon) for lon in lons]
+        warn_lats.append(warn_lats[0])
+        warn_lons.append(warn_lons[0])
+        self.geofence_warning_line.setData(warn_lons, warn_lats)
+        
+        # Show vertex markers
+        self.geofence_vertex_markers.setData(lons, lats)
+    
+    def _clear_geofence_drawing(self):
+        """Remove geofence lines from map"""
+        self.geofence_breach_line.setData([], [])
+        self.geofence_warning_line.setData([], [])
+        self.geofence_vertex_markers.setData([], [])
+    
+    def check_geofence(self, lat, lon):
+        """Check if position is within geofence boundaries.
+        
+        Returns:
+            dict with 'status': 'safe'|'warning'|'breach', 'distance_pct': float
+        """
+        if not self.geofence_enabled:
+            return {'status': 'safe', 'distance_pct': 0.0}
+        
+        if self.geofence_type == 'circle':
+            return self._check_circle_geofence(lat, lon)
+        else:
+            return self._check_polygon_geofence(lat, lon)
+    
+    def _check_circle_geofence(self, lat, lon):
+        """Check position against circular geofence"""
+        if not self.home_position:
+            return {'status': 'safe', 'distance_pct': 0.0}
+        
+        center_lat, center_lon = self.home_position
+        
+        # Haversine distance
+        R = 6371000  # Earth radius in meters
+        dlat = np.radians(lat - center_lat)
+        dlon = np.radians(lon - center_lon)
+        a = (np.sin(dlat/2)**2 + 
+             np.cos(np.radians(center_lat)) * np.cos(np.radians(lat)) * 
+             np.sin(dlon/2)**2)
+        distance = R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+        
+        distance_pct = (distance / self.geofence_radius) * 100.0
+        
+        if distance >= self.geofence_radius:
+            return {'status': 'breach', 'distance_pct': distance_pct}
+        elif distance >= self.geofence_radius * 0.8:
+            return {'status': 'warning', 'distance_pct': distance_pct}
+        else:
+            return {'status': 'safe', 'distance_pct': distance_pct}
+    
+    def _check_polygon_geofence(self, lat, lon):
+        """Check position against polygon geofence using ray casting"""
+        if len(self.geofence_polygon_points) < 3:
+            return {'status': 'safe', 'distance_pct': 0.0}
+        
+        # Check breach boundary (full polygon)
+        inside_breach = self._point_in_polygon(lat, lon, self.geofence_polygon_points)
+        
+        if not inside_breach:
+            return {'status': 'breach', 'distance_pct': 100.0}
+        
+        # Check warning boundary (80% shrunk polygon)
+        centroid_lat = np.mean([p[0] for p in self.geofence_polygon_points])
+        centroid_lon = np.mean([p[1] for p in self.geofence_polygon_points])
+        warn_points = [
+            (centroid_lat + 0.8 * (p[0] - centroid_lat), 
+             centroid_lon + 0.8 * (p[1] - centroid_lon))
+            for p in self.geofence_polygon_points
+        ]
+        inside_warning = self._point_in_polygon(lat, lon, warn_points)
+        
+        if not inside_warning:
+            return {'status': 'warning', 'distance_pct': 85.0}
+        else:
+            return {'status': 'safe', 'distance_pct': 50.0}
+    
+    def _point_in_polygon(self, lat, lon, polygon):
+        """Ray casting algorithm for point-in-polygon test"""
+        n = len(polygon)
+        inside = False
+        
+        j = n - 1
+        for i in range(n):
+            yi, xi = polygon[i]
+            yj, xj = polygon[j]
+            
+            if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        
+        return inside
+    
+    def update_geofence_status(self, status):
+        """Update geofence status display based on check result"""
+        if not self.geofence_enabled:
+            return
+        
+        state = status['status']
+        pct = status['distance_pct']
+        
+        if state == 'breach':
+            self.geofence_breach = True
+            self.geofence_warning = False
+            self.geofence_status_label.setText(f"BREACH! ({pct:.0f}%)")
+            self.geofence_status_label.setStyleSheet(
+                "font-weight: bold; padding: 4px 8px; background-color: #e53935; "
+                "color: white; border-radius: 3px;"
+            )
+        elif state == 'warning':
+            self.geofence_breach = False
+            self.geofence_warning = True
+            self.geofence_status_label.setText(f"WARNING ({pct:.0f}%)")
+            self.geofence_status_label.setStyleSheet(
+                "font-weight: bold; padding: 4px 8px; background-color: #FF8C00; "
+                "color: white; border-radius: 3px;"
+            )
+        else:
+            self.geofence_breach = False
+            self.geofence_warning = False
+            self.geofence_status_label.setText("ACTIVE")
+            self.geofence_status_label.setStyleSheet(
+                "font-weight: bold; padding: 4px 8px; background-color: #51cf66; "
+                "color: white; border-radius: 3px;"
+            )
+    
     def create_map_widget(self):
         """Create interactive map for waypoint planning"""
         group = QGroupBox("Mission Map (Click to Add Waypoint)")
@@ -558,6 +907,18 @@ class MissionControlPanel(QWidget):
             pen=pg.mkPen(color='lime', width=2), symbol='o'
         )
         self.map_plot.addItem(self.active_wp_marker)
+        
+        # Geofence boundaries
+        self.geofence_breach_line = self.map_plot.plot(
+            pen=pg.mkPen(color='r', width=2, style=Qt.DashLine)
+        )
+        self.geofence_warning_line = self.map_plot.plot(
+            pen=pg.mkPen(color=(255, 165, 0), width=1, style=Qt.DotLine)
+        )
+        self.geofence_vertex_markers = pg.ScatterPlotItem(
+            size=8, brush=pg.mkBrush(255, 100, 100), symbol='d'
+        )
+        self.map_plot.addItem(self.geofence_vertex_markers)
         
         # Click handler
         self.map_plot.scene().sigMouseClicked.connect(self.on_map_click)
@@ -627,14 +988,37 @@ class MissionControlPanel(QWidget):
         return group
     
     def on_map_click(self, event):
-        """Handle map click to add waypoint"""
+        """Handle map click to add waypoint or geofence polygon vertex"""
         pos = event.scenePos()
         if self.map_plot.sceneBoundingRect().contains(pos):
             mouse_point = self.map_plot.getViewBox().mapSceneToView(pos)
             lon = mouse_point.x()
             lat = mouse_point.y()
             
-            # Add waypoint
+            # Check if we're in polygon vertex adding mode
+            if self._adding_polygon_vertices:
+                self.geofence_polygon_points.append((lat, lon))
+                count = len(self.geofence_polygon_points)
+                self.geofence_vertex_count.setText(f"{count} vertices")
+                logger.info(f"Geofence vertex added: ({lat:.6f}, {lon:.6f}) — {count} total")
+                
+                # Draw polygon preview if 3+ vertices
+                if count >= 3:
+                    self._draw_polygon_geofence()
+                    if self.geofence_enabled:
+                        self.geofence_status_label.setText("ACTIVE")
+                        self.geofence_status_label.setStyleSheet(
+                            "font-weight: bold; padding: 4px 8px; background-color: #51cf66; "
+                            "color: white; border-radius: 3px;"
+                        )
+                elif count >= 1:
+                    # Show vertex markers even with <3 points
+                    lons = [p[1] for p in self.geofence_polygon_points]
+                    lats = [p[0] for p in self.geofence_polygon_points]
+                    self.geofence_vertex_markers.setData(lons, lats)
+                return
+            
+            # Normal waypoint adding
             alt = self.alt_spin.value()
             wp = Waypoint(lat, lon, alt)
             wp.loiter_time = self.loiter_spin.value()
@@ -709,6 +1093,10 @@ class MissionControlPanel(QWidget):
         if lat != 0 and lon != 0:
             self.map_plot.setXRange(lon - 0.01, lon + 0.01)
             self.map_plot.setYRange(lat - 0.01, lat + 0.01)
+        
+        # Auto-draw circle geofence if enabled
+        if self.geofence_enabled and self.geofence_type == 'circle':
+            self._draw_circle_geofence()
     
     def update_current_position(self, lat, lon):
         """Update aircraft current position marker"""
