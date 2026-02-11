@@ -20,6 +20,7 @@ class TelemetryBridge:
         # Battery
         self.battery_voltage = 0.0
         self.battery_remaining = 0
+        self.battery_failsafe_triggered = False  # Prevent repeated triggers
         
         # GPS
         self.gps_fix_type = 0
@@ -279,13 +280,15 @@ class TelemetryBridge:
                 return await self._arm_force()
             elif command == "DISARM":
                 return await self._disarm()
+            elif command == "FORCE_DISARM":
+                return await self._force_disarm()
             elif command == "TAKEOFF":
                 altitude = params.get("altitude", 50)
                 return await self._takeoff(altitude)
             elif command == "RTL":
                 return await self._set_mode("RTL")
             elif command == "LAND":
-                return await self._set_mode("QLAND")
+                return await self._emergency_land()
             elif command == "AUTO":
                 return await self._start_mission()
             elif command == "CHANGE_ALTITUDE":
@@ -352,6 +355,44 @@ class TelemetryBridge:
         )
         
         logger.info("DISARM command sent")
+        return True
+    
+    async def _force_disarm(self):
+        """Force DISARM regardless of flight state (emergency motor kill)"""
+        logger.warning("EMERGENCY: Force disarming motors!")
+        
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self.connection.mav.command_long_send,
+            self.connection.target_system,
+            self.connection.target_component,
+            400,    # MAV_CMD_COMPONENT_ARM_DISARM
+            0,      # confirmation
+            0,      # param1: 0 = DISARM
+            21196,  # param2: 21196 = force (bypasses checks)
+            0, 0, 0, 0, 0
+        )
+        
+        logger.warning("FORCE DISARM sent — motors should cut immediately")
+        return True
+    
+    async def _emergency_land(self):
+        """Force landing by interrupting current mode.
+        
+        Switches to GUIDED first (reliably interrupts AUTO), then LAND.
+        This prevents AUTO from overriding the LAND mode change.
+        """
+        logger.info("Emergency land: switching GUIDED → LAND...")
+        
+        # Step 1: Switch to GUIDED to interrupt any AUTO navigation
+        await self._set_mode("GUIDED")
+        await asyncio.sleep(0.3)
+        
+        # Step 2: Now switch to LAND — this will stick since we're in GUIDED
+        await self._set_mode("LAND")
+        
+        logger.info("Emergency land sequence sent (GUIDED → LAND)")
         return True
     
     async def _set_mode(self, mode_name):
@@ -470,23 +511,41 @@ class TelemetryBridge:
         return True
     
     async def _change_altitude(self, altitude):
-        """Change target altitude (for GUIDED or LOITER modes)"""
-        logger.info(f"Changing altitude to {altitude}m...")
+        """Change target altitude mid-flight.
         
+        Switches to GUIDED mode, sends position target at new altitude.
+        Works regardless of current flight mode (AUTO, LOITER, etc.)
+        """
+        logger.info(f"Changing altitude to {altitude}m (current mode: {self.current_mode})...")
+        
+        # Remember current mode to potentially resume
+        previous_mode = self.current_mode
+        
+        # Switch to GUIDED for position control
+        if self.current_mode != "GUIDED":
+            logger.info("Switching to GUIDED for altitude change...")
+            await self._set_mode("GUIDED")
+            await asyncio.sleep(0.5)
+        
+        # Send SET_POSITION_TARGET_GLOBAL_INT with current lat/lon but new altitude
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None,
-            self.connection.mav.command_long_send,
+            self.connection.mav.set_position_target_global_int_send,
+            0,  # time_boot_ms (not used)
             self.connection.target_system,
             self.connection.target_component,
-            mavutil.mavlink.MAV_CMD_CONDITION_CHANGE_ALT,
-            0,  # confirmation
-            altitude,  # param1: target altitude (meters)
-            0,  # param2: frame (0 = relative to home)
-            0, 0, 0, 0, 0  # unused params
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            0b0000111111111000,  # type_mask: use only position (ignore velocity/accel/yaw)
+            int(self.latitude * 1e7),   # lat_int
+            int(self.longitude * 1e7),  # lon_int
+            altitude,                    # alt (meters, relative)
+            0, 0, 0,  # vx, vy, vz
+            0, 0, 0,  # afx, afy, afz
+            0, 0      # yaw, yaw_rate
         )
         
-        logger.info(f"Altitude change command sent: {altitude}m")
+        logger.info(f"GUIDED position target sent: ({self.latitude:.6f}, {self.longitude:.6f}) @ {altitude}m")
         return True
     
     async def _loiter_here(self):

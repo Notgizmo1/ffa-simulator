@@ -1,4 +1,5 @@
 import logging
+import time
 import numpy as np
 from collections import deque
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
@@ -38,6 +39,7 @@ class MissionControlPanel(QWidget):
         self.waypoints = []
         self.current_waypoint_index = -1
         self.home_position = None  # (lat, lon)
+        self.flight_start_time = None  # Timestamp when mission started
         
         self.init_ui()
         
@@ -315,6 +317,12 @@ class MissionControlPanel(QWidget):
         self.progress_groundspeed.setAlignment(Qt.AlignCenter)
         right_layout.addWidget(self.progress_groundspeed)
         
+        # Flight timer
+        self.flight_timer_label = QLabel("Flight Time: 00:00:00")
+        self.flight_timer_label.setStyleSheet("font-weight: bold; font-size: 10pt; color: #51cf66;")
+        self.flight_timer_label.setAlignment(Qt.AlignCenter)
+        right_layout.addWidget(self.flight_timer_label)
+        
         main_layout.addLayout(right_layout)
         
         return group
@@ -380,12 +388,25 @@ class MissionControlPanel(QWidget):
                 "font-weight: bold; font-size: 11pt; padding: 4px; "
                 "background-color: #2196F3; color: white; border-radius: 3px;"
             )
+            # Start flight timer on first active update
+            if self.flight_start_time is None:
+                self.flight_start_time = time.time()
+                logger.info("Flight timer started")
         else:
             self.progress_status.setText("MISSION LOADED")
             self.progress_status.setStyleSheet(
                 "font-weight: bold; font-size: 11pt; padding: 4px; "
                 "background-color: #FF8C00; color: white; border-radius: 3px;"
             )
+        
+        # Update flight timer
+        if self.flight_start_time is not None:
+            elapsed = time.time() - self.flight_start_time
+            hours = int(elapsed // 3600)
+            minutes = int((elapsed % 3600) // 60)
+            seconds = int(elapsed % 60)
+            self.flight_timer_label.setText(f"Flight Time: {hours:02d}:{minutes:02d}:{seconds:02d}")
+            self.flight_timer_label.setStyleSheet("font-weight: bold; font-size: 10pt; color: #51cf66;")
         
         # Current waypoint display (1-indexed for user)
         self.progress_current_wp.setText(f"{user_wp_index + 1} / {total_wps}")
@@ -507,7 +528,8 @@ class MissionControlPanel(QWidget):
     def update_altitude_display(self, altitude):
         """Update current altitude display"""
         self.current_altitude = altitude
-        self.current_alt_label.setText(f"Current Altitude: {altitude:.1f}m")
+        display_alt = max(0.0, altitude)  # Clamp to 0 on ground
+        self.current_alt_label.setText(f"Current Altitude: {display_alt:.1f}m")
     
     def update_position_display(self, lat, lon):
         """Update current position display"""
@@ -684,6 +706,8 @@ class MissionControlPanel(QWidget):
             self.waypoints.clear()
             self.update_waypoint_display()
             self.active_wp_marker.setData([], [])
+            self.flight_start_time = None
+            self.flight_timer_label.setText("Flight Time: 00:00:00")
             logger.info("Mission cleared")
     
     def set_home_position(self, lat, lon):
@@ -722,27 +746,30 @@ class MissionControlPanel(QWidget):
         self.command_requested.emit("TAKEOFF", {"altitude": alt})
     
     def save_mission(self):
-        """Save mission to file"""
+        """Save mission to file (QGC WPL 110 format, preserves loiter time)"""
         if len(self.waypoints) == 0:
             QMessageBox.warning(self, "No Mission", "No waypoints to save.")
             return
         
-        filename, _ = QFileDialog.getSaveFileName(self, "Save Mission", "", "Waypoint Files (*.waypoints)")
+        filename, _ = QFileDialog.getSaveFileName(self, "Save Mission", "", "Waypoint Files (*.waypoints);;All Files (*)")
         if filename:
             try:
                 with open(filename, 'w') as f:
-                    f.write("QGC WPL 110\n")  # ArduPilot format header
+                    # QGC WPL 110 format:
+                    # seq current frame command p1 p2 p3 p4 lat lon alt autocontinue
+                    f.write("QGC WPL 110\n")
                     for i, wp in enumerate(self.waypoints):
-                        f.write(f"{i+1}\t0\t3\t16\t0\t0\t0\t0\t{wp.lat}\t{wp.lon}\t{wp.alt}\t1\n")
-                logger.info(f"Mission saved to {filename}")
-                QMessageBox.information(self, "Success", f"Mission saved to {filename}")
+                        # command 16 = NAV_WAYPOINT, p1 = hold time (loiter), p2 = acceptance radius
+                        f.write(f"{i+1}\t0\t3\t16\t{wp.loiter_time}\t{wp.acceptance_radius}\t0\t0\t{wp.lat:.8f}\t{wp.lon:.8f}\t{wp.alt:.1f}\t1\n")
+                logger.info(f"Mission saved to {filename} ({len(self.waypoints)} waypoints)")
+                QMessageBox.information(self, "Success", f"Mission saved: {len(self.waypoints)} waypoints")
             except Exception as e:
                 logger.error(f"Failed to save mission: {e}")
                 QMessageBox.critical(self, "Error", f"Failed to save: {e}")
     
     def load_mission(self):
-        """Load mission from file"""
-        filename, _ = QFileDialog.getOpenFileName(self, "Load Mission", "", "Waypoint Files (*.waypoints)")
+        """Load mission from file (QGC WPL 110 format, restores loiter time)"""
+        filename, _ = QFileDialog.getOpenFileName(self, "Load Mission", "", "Waypoint Files (*.waypoints);;All Files (*)")
         if filename:
             try:
                 self.waypoints.clear()
@@ -754,7 +781,12 @@ class MissionControlPanel(QWidget):
                             lat = float(parts[8])
                             lon = float(parts[9])
                             alt = float(parts[10])
-                            self.waypoints.append(Waypoint(lat, lon, alt))
+                            wp = Waypoint(lat, lon, alt)
+                            # Restore loiter time (p1) and acceptance radius (p2)
+                            if len(parts) >= 6:
+                                wp.loiter_time = int(float(parts[4]))
+                                wp.acceptance_radius = float(parts[5])
+                            self.waypoints.append(wp)
                 
                 self.update_waypoint_display()
                 logger.info(f"Loaded {len(self.waypoints)} waypoints from {filename}")

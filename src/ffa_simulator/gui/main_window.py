@@ -1,8 +1,11 @@
 import logging
 import asyncio
+import csv
+import time
+import os
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                 QPushButton, QLabel, QComboBox, QTextEdit, QSplitter,
-                                QTabWidget)
+                                QTabWidget, QFileDialog, QMessageBox)
 from PySide6.QtCore import Qt, QTimer
 from ffa_simulator.orchestrator.process_manager import ProcessManager
 from ffa_simulator.telemetry.mavlink_bridge import TelemetryBridge
@@ -29,6 +32,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.process_manager = ProcessManager()
         self.telemetry_bridge = TelemetryBridge()
+        self.telemetry_log = []  # List of dicts for CSV export
+        self.recording_start_time = None
         self.init_ui()
         self.setup_logging()
         self.setup_telemetry_timer()
@@ -110,6 +115,13 @@ class MainWindow(QMainWindow):
         self.log_display.setMaximumHeight(300)
         layout.addWidget(self.log_display)
         
+        # Export flight data button
+        self.export_button = QPushButton("Export Flight Data (CSV)")
+        self.export_button.clicked.connect(self.export_telemetry)
+        self.export_button.setEnabled(False)
+        self.export_button.setStyleSheet("background-color: #228be6; color: white; font-weight: bold; padding: 8px;")
+        layout.addWidget(self.export_button)
+        
         layout.addStretch()
         
         return panel
@@ -180,6 +192,54 @@ class MainWindow(QMainWindow):
         if waypoints and current_seq >= 2:
             user_wp_index = current_seq - 2
             self.mission_control_panel.update_active_waypoint_marker(waypoints, user_wp_index)
+        
+        # ── Telemetry Recording (for CSV export) ──
+        if self.recording_start_time is None:
+            self.recording_start_time = time.time()
+        
+        # ── Battery Failsafe ──
+        battery_pct = telemetry.get('battery_remaining', 100)
+        if battery_pct <= 0 and telemetry['armed']:
+            # 0% battery — emergency motor kill
+            if not hasattr(self, '_force_disarm_sent') or not self._force_disarm_sent:
+                self._force_disarm_sent = True
+                logger.warning("BATTERY DEAD: 0% — FORCE DISARM (motor kill)")
+                self.send_command("FORCE_DISARM", {})
+        elif battery_pct <= 10 and battery_pct > 0 and telemetry['armed']:
+            self._force_disarm_sent = False
+            if not self.telemetry_bridge.battery_failsafe_triggered:
+                self.telemetry_bridge.battery_failsafe_triggered = True
+                logger.warning(f"BATTERY CRITICAL: {battery_pct}% — Commanding emergency LAND")
+            
+            # Persistently enforce LAND mode — re-command every 5 seconds if overridden
+            current_mode = telemetry.get('mode', '')
+            if current_mode not in ('LAND', 'QLAND', 'RTL'):
+                if not hasattr(self, '_last_failsafe_land') or (time.time() - self._last_failsafe_land) > 5:
+                    self._last_failsafe_land = time.time()
+                    logger.warning(f"BATTERY FAILSAFE: Overriding {current_mode} → LAND ({battery_pct}%)")
+                    self.send_command("LAND", {})
+        elif battery_pct > 20:
+            self.telemetry_bridge.battery_failsafe_triggered = False
+            self._force_disarm_sent = False
+        
+        elapsed = time.time() - self.recording_start_time
+        self.telemetry_log.append({
+            'time_s': round(elapsed, 2),
+            'mode': telemetry['mode'],
+            'armed': telemetry['armed'],
+            'altitude_m': round(telemetry['altitude'], 2),
+            'groundspeed_ms': round(groundspeed, 2),
+            'latitude': round(lat, 8),
+            'longitude': round(lon, 8),
+            'roll_deg': round(telemetry.get('roll', 0), 2),
+            'pitch_deg': round(telemetry.get('pitch', 0), 2),
+            'yaw_deg': round(telemetry.get('yaw', 0), 2),
+            'battery_v': round(telemetry.get('battery_voltage', 0), 2),
+            'battery_pct': telemetry.get('battery_remaining', 0),
+            'gps_fix': telemetry.get('gps_fix', 0),
+            'gps_sats': telemetry.get('gps_satellites', 0),
+            'wp_seq': current_seq,
+        })
     
     def upload_mission(self, waypoints):
         """Upload mission to autopilot"""
@@ -199,6 +259,13 @@ class MainWindow(QMainWindow):
     
     def send_command(self, command, params):
         """Send flight command to autopilot"""
+        # Block dangerous commands during battery failsafe
+        if self.telemetry_bridge.battery_failsafe_triggered:
+            blocked_commands = ("AUTO", "ARM", "ARM_FORCE", "TAKEOFF", "CHANGE_ALTITUDE", "GUIDED")
+            if command in blocked_commands:
+                logger.warning(f"BLOCKED: {command} rejected — battery failsafe active. Land or disarm first.")
+                return
+        
         logger.info(f"Sending command: {command} with params: {params}")
         
         async def command_async():
@@ -244,6 +311,9 @@ class MainWindow(QMainWindow):
                 if connected:
                     logger.info("Telemetry connected")
                     self.telemetry_timer.start()
+                    self.telemetry_log.clear()
+                    self.recording_start_time = None
+                    self.export_button.setEnabled(True)
                 else:
                     logger.warning("Telemetry connection failed")
                 
@@ -262,6 +332,37 @@ class MainWindow(QMainWindow):
                 self.status_label.setStyleSheet("padding: 10px; background-color: #ff6b6b; color: white; border-radius: 5px;")
         
         asyncio.create_task(start_async())
+    
+    def export_telemetry(self):
+        """Export recorded telemetry data to CSV file"""
+        if not self.telemetry_log:
+            QMessageBox.warning(self, "No Data", "No telemetry data recorded yet.")
+            return
+        
+        # Default filename with timestamp
+        default_name = f"flight_data_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export Flight Data", default_name, "CSV Files (*.csv);;All Files (*)"
+        )
+        
+        if filename:
+            try:
+                fieldnames = list(self.telemetry_log[0].keys())
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(self.telemetry_log)
+                
+                rows = len(self.telemetry_log)
+                duration = self.telemetry_log[-1]['time_s'] if self.telemetry_log else 0
+                logger.info(f"Telemetry exported: {rows} samples, {duration:.1f}s to {filename}")
+                QMessageBox.information(
+                    self, "Export Complete", 
+                    f"Exported {rows} data points ({duration:.0f}s of flight data)\n\nSaved to: {filename}"
+                )
+            except Exception as e:
+                logger.error(f"Export failed: {e}")
+                QMessageBox.critical(self, "Export Error", f"Failed to export: {e}")
     
     def stop_simulation(self):
         logger.info("Stopping simulation...")
